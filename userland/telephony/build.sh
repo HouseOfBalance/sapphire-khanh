@@ -1,0 +1,33 @@
+#!/bin/bash
+# qmitool (QMI to the modem over /dev/redwood-qmiN, kernel 0220). Copy to the phone, e.g.
+# /var/jb/usr/bin/qmitool, and run it as root.
+set -e
+cd "$(dirname "$0")"
+SDK=${SDK:-/serverhive/angelpro09devv/sdks/theos-sdks/iPhoneOS16.5.sdk}
+L=${LLVM:-/usr/lib/llvm-18/bin}
+mkdir -p ../obj
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
+	-o ../obj/qmitool qmitool.c
+echo "../obj/qmitool"
+# ccbridge.dylib: loaded into CommCenter (DYLD_INSERT_LIBRARIES), installed as /redwood/lib/ccbridge.dylib
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
+	-dynamiclib -install_name /redwood/lib/ccbridge.dylib -framework CoreFoundation -framework IOKit -o ../obj/ccbridge.dylib ccbridge.c
+echo "../obj/ccbridge.dylib"
+# ccstart: CommCenter's launchd Program (/redwood/bin/ccstart), sets DYLD_INSERT_LIBRARIES and execs it
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -o ../obj/ccstart ccstart.c
+echo "../obj/ccstart"
+# pdpnet: the data call's IPv4 + DNS published to configd (/var/root/pdpnet, run by qmitool datacall)
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
+	-framework CoreFoundation -framework SystemConfiguration -framework CoreTelephony -o ../obj/pdpnet pdpnet.c
+echo "../obj/pdpnet"
+# ctdial: a call straight through CommCenter (CTCallDial), for testing the dial path without the Phone app
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
+	-framework CoreFoundation -o ../obj/ctdial ctdial.c
+ldid -Sctdial.entitlements ../obj/ctdial 2>/dev/null || echo "sign ../obj/ctdial with ctdial.entitlements"
+echo "../obj/ctdial"
+# libsapphire-fakebb.dylib + bbstart: the fake AppleBaseband for locationd and abm-helper (fakebb.c, bbstart.c); install-bbstart.sh
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -Wextra -Wno-unused-parameter \
+	-dynamiclib -install_name /redwood/lib/libsapphire-fakebb.dylib -framework CoreFoundation -framework IOKit \
+	-o ../obj/libsapphire-fakebb.dylib fakebb.c
+$L/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall -o ../obj/bbstart bbstart.c
+echo "../obj/libsapphire-fakebb.dylib ../obj/bbstart"

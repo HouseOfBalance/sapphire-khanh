@@ -1,0 +1,2685 @@
+From ab27e0ef4eceb3c07b52f9a6ba54b314d4be869a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 06:53:53 +0000
+Subject: [PATCH] sapphire-0145: Adreno 610 bring-up (power, zap shader, SMMU,
+ command processor)
+
+The GPU of this phone has no GMU, so the host powers it up itself. Boot-arg
+gpu=N stages the work, because reading a GPU register with its power domain
+or clocks off hangs the bus: gpu=1 logs the clock tree, gpu=2 powers the GPU
+up and reads RBBM_STATUS and the always-on counter, gpu=3 loads the zap
+shader through TrustZone (PAS 13), makes an identity SMMU bank, starts the
+SQE microcode on a 32 KB ring and proves the GPU runs commands with
+CP_ME_INIT, CP_SET_SECURE_MODE and a CP_MEM_WRITE the CPU reads back.
+
+The sequence, the register values and the traps are topaz-woa's TopazGpu
+(docs/P8_gpu.md), which did this on the same SoC under Windows; the SCM
+calls, the identity bank and the sub-4 GB pool follow TopazModem. sapphire's
+zap region is 0x55A15000 (DT gpu_region), not topaz's 0x55B15000.
+
+Qualcomm's GPU firmware is not in this repository: gpu_fw[] says where the
+files lie in a stock partition and is filled in by tools/fwtable-vendor.py.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp      | 2313 +++++++++++++++++++++++++
+ iokit/Kernel/arm/SapphireReplay3D.h   |  298 ++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |    2 +
+ iokit/conf/files.arm64                |    1 +
+ 4 files changed, 2614 insertions(+)
+ create mode 100644 iokit/Kernel/arm/SapphireGpu.cpp
+ create mode 100644 iokit/Kernel/arm/SapphireReplay3D.h
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+new file mode 100644
+index 0000000..838e1f2
+--- /dev/null
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -0,0 +1,2313 @@
++/*
++ * Adreno 610 v2 (A6xx, chip id 0x06010001) bring-up on sapphire.
++ *
++ * The phone has no GMU: Linux drives this GPU through a "GMU wrapper", so the host does the
++ * power-up itself. The sequence, the register values and the traps below are topaz-woa's
++ * TopazGpu (docs/P8_gpu.md, G1 done on the same SoC under Windows), redone here on XNU with
++ * the pieces TopazModem already brings to this kernel: SCM calls into TrustZone, an identity
++ * SMMU context bank, and RAM below 4 GB that the kernel does not manage.
++ *
++ * Staged by boot-arg gpu=N, because reading a GPU register while its power domain or its
++ * clocks are off hangs the bus (the same trap as the WLAN copy engines before mission mode):
++ *
++ * gpu_slow=N waits N ms after each step so the persistent log catches up with it,
++ * gpu_delay=N waits N seconds before starting so the live console over USB is already up,
++ * gpu_div=N runs the core at GPLL0/N (2 = 300 MHz, 8 = 75 MHz), and gpu_smmu_early=1 puts the
++ * identity context bank in before the GX domain. Those two default to what has run before:
++ * a boot that dies with every clock up and nothing else to show for it has to be bisected one
++ * variable at a time. gpu_irq=1 is the exception, because it only turns off something this
++ * driver has no business leaving on: the GPU's interrupt, masked by default in the GIC before
++ * anything is powered and at the GPU itself as soon as its registers answer.
++ *
++ *   gpu=1   clock tree only; never touches 0x5900000
++ *   gpu=2   + power up, then the first GPU reads (RBBM_STATUS, CP_ALWAYS_ON_COUNTER)
++ *   gpu=3   + zap shader through TrustZone, identity SMMU, SQE microcode, ring buffer,
++ *             CP_ME_INIT, CP_SET_SECURE_MODE and a CP_MEM_WRITE the CPU reads back
++ *   gpu=4   the same without the zap shader, leaving secure mode by writing
++ *             RBBM_SECVID_TRUST_CNTL as Linux does when a device has no zap firmware
++ *
++ * Both need the microcode (a630_sqe.fw, which is in linux-firmware); gpu=3 also needs this
++ * phone's signed zap shader. Neither is in this repository. The driver takes them from the
++ * device tree when the boot image carries them (tools/mkadt.py --gpu-sqe / --gpu-zap-mdt /
++ * --gpu-zap-seg), and otherwise from a stock partition, read only through
++ * sweet_ufs_read_part, with gpu_fw[] below filled in by tools/fwtable-file.py.
++ *
++ * gpu=4 is the shortcut for a first test with only the open microcode. It is a gamble Linux
++ * warns about: if the bootloader left the GPU in secure mode, writing that register is
++ * refused and a permissions violation follows, so prefer gpu=3 once the zap is in the table.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <libkern/crc.h>
++#include <sys/param.h>
++#include <sys/errno.h>
++#include <pexpert/device_tree.h>
++
++#define LOG(fmt, ...)       IOLog("SapphireGpu: " fmt "\n", ##__VA_ARGS__)
++
++extern "C" void sapphire_gpu_init(void);
++extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++
++/* ---------------------------------------------------------------- the hardware */
++
++#define GCC_PA              0x01400000ull
++#define GCC_SIZE            0x00080000u
++#define GPUCC_PA            0x05990000ull
++#define GPUCC_SIZE          0x00009000u
++#define GPU_PA              0x05900000ull
++#define GPU_SIZE            0x00040000u
++#define SMMU_PA             0x059A0000ull       /* kgsl-smmu, SMMU-500 */
++#define SMMU_SIZE           0x00010000u
++
++/*
++ * The GIC-500 distributor, and the GPU's interrupt in it. The device tree gives kgsl
++ * "interrupts = <0 0xb1 4>": SPI 177, level high, so INTID 177 + 32 = 209, which lives in
++ * word 6 (209 / 32) of each GICD bitmap, bit 17. Nothing in this kernel handles it.
++ */
++#define GICD_PA             0x0F200000ull
++#define GICD_SIZE           0x00010000u
++#define GICD_ISENABLER      0x0100u
++#define GICD_ICENABLER      0x0180u
++#define GICD_ISPENDR        0x0200u
++#define GICD_ICPENDR        0x0280u
++#define GICD_ISACTIVER      0x0300u
++#define GPU_INTID           (177u + 32u)
++#define GPU_INT_WORD        (4u * (GPU_INTID / 32u))
++#define GPU_INT_BIT         (1u << (GPU_INTID % 32u))
++
++/* DT gpu_region@55A15000 (topaz has the same region at 0x55B15000) */
++#define ZAP_PA              0x55A15000ull
++#define ZAP_SIZE            0x00002000u
++#define GPU_PAS_ID          13
++
++/*
++ * Buffers the GPU reads by physical address: RAM the kernel does not manage, below
++ * 0xF0000000 for TrustZone and the hardware, right after the modem's pool
++ * (MODEM_POOL_BASE 0xE0000000 + 16 MB). A610 has ADRENO_QUIRK_4GB_VA, so everything the
++ * GPU touches must stay below 4 GB anyway.
++ */
++#define POOL_PA             0xE1000000ull
++#define POOL_SIZE           0x00100000u
++#define OFF_SQE             0x00000u            /* microcode, up to 64 KB */
++#define OFF_RING            0x10000u            /* 32 KB, 64 KB aligned */
++#define OFF_TEST            0x18000u            /* what CP_MEM_WRITE writes */
++#define OFF_META            0x19000u            /* zap metadata, read by TrustZone */
++#define OFF_FENCE           0x18100u            /* where the CCU/cache flush events write their seqno */
++#define OFF_DRAW            0x40000u            /* what the 2D blitter fills: 256 x 256 RGBA8, 256 KB */
++#define OFF_PT              0x80000u            /* GPU page tables: 128 pages of 4 KB */
++#define OFF_CS              0x30000u            /* compute shader binary */
++#define OFF_CSOUT           0x31000u            /* what it writes */
++#define PT_PAGES            128u
++#define DRAW_W              256u
++#define DRAW_H              256u
++#define DRAW_PITCH          (DRAW_W * 4u)       /* bytes; the blitter wants a multiple of 64 */
++#define RING_BYTES          0x8000u
++#define RING_DWORDS         (RING_BYTES / 4)
++
++#define CBCR_EN             (1u << 0)
++#define CBCR_OFF            (1u << 31)
++#define GDSC_COLLAPSE       (1u << 0)
++#define GDSC_PWR_ON         (1u << 31)
++#define RCG_UPDATE          (1u << 0)
++#define RCG_ROOT_OFF        (1u << 31)
++#define SRC_GPLL0           5                   /* GPLL0_OUT_MAIN in the GPU CC parent maps */
++
++/* A6xx registers, dword offsets (registers/adreno/a6xx.xml) */
++#define REG_RBBM_GBIF_HALT      0x0016
++#define REG_RBBM_GBIF_HALT_ACK  0x0017
++#define REG_RBBM_INT_CLEAR_CMD  0x0037
++#define REG_GBIF_HALT           0x3c45
++#define REG_GBIF_HALT_ACK       0x3c46
++#define GBIF_CLIENT_HALT        (1u << 0)
++#define GBIF_ARB_HALT           (1u << 1)
++#define REG_RBBM_INT_0_MASK     0x0038
++#define REG_RBBM_INT_0_STATUS   0x0201
++#define REG_RBBM_STATUS         0x0210
++#define REG_CP_RB_BASE          0x0800
++#define REG_CP_RB_CNTL          0x0802
++#define REG_CP_RB_RPTR          0x0806
++#define REG_CP_RB_WPTR          0x0807
++#define REG_CP_SQE_CNTL         0x0808
++#define REG_CP_HW_FAULT         0x0821
++#define REG_CP_SQE_INSTR_BASE   0x0830
++#define REG_CP_ALWAYS_ON_COUNTER 0x0980
++#define REG_RBBM_SECVID_TRUST_CNTL 0xF400
++
++#define CP_ME_INIT              0x48
++#define CP_MEM_WRITE            0x3d
++#define CP_SET_SECURE_MODE      0x66
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_EVENT_WRITE          0x46
++#define CP_SET_MARKER           0x65
++#define CP_BLIT                 0x2c
++
++/*
++ * The 2D blitter, as Mesa's freedreno does a buffer clear on a6xx gen1 (fd6_blitter.cc
++ * fd6_clear_buffer, emit_setup / emit_blit_setup / emit_blit_fini; offsets and fields from the
++ * same tree's registers/adreno/a6xx.xml, a610's values from common/freedreno_devices.py).
++ */
++#define REG_RB_A2D_BLT_CNTL         0x8c00
++#define REG_RB_A2D_PIXEL_CNTL       0x8c01
++#define REG_RB_A2D_DEST_BUFFER_INFO 0x8c17      /* + BASE (64-bit) at 0x8c18, PITCH at 0x8c1a */
++#define REG_RB_A2D_CLEAR_COLOR_DW0  0x8c2c      /* DW0..DW3 */
++#define REG_TPL1_A2D_SRC_TEXTURE_INFO 0xb4c0    /* + SIZE 0xb4c1, BASE (64-bit) 0xb4c2, PITCH 0xb4c4 */
++#define REG_GRAS_A2D_SRC_XMIN       0x8401      /* + XMAX, YMIN, YMAX: coordinate << 8 */
++#define REG_GRAS_A2D_BLT_CNTL       0x8400
++#define REG_GRAS_A2D_DEST_TL        0x8405      /* + BR at 0x8406 */
++#define REG_SP_A2D_OUTPUT_INFO      0xacc0
++#define REG_RB_CCU_CNTL             0x8e07
++#define REG_RB_DBG_ECO_CNTL         0x8e04
++#define REG_RB_RBP_CNTL             0x8e01
++#define FMT6_8_8_8_8_UNORM          0x30
++#define RM6_BLIT2DSCALE             12
++#define BLIT_OP_SCALE               3
++#define EV_PC_CCU_FLUSH_COLOR_TS    0x1d
++#define EV_PC_CCU_FLUSH_DEPTH_TS    0x1c
++#define EV_PC_CCU_INVALIDATE_COLOR  0x19
++#define EV_PC_CCU_INVALIDATE_DEPTH  0x18
++#define EV_CACHE_FLUSH_TS           0x04
++#define EV_DEBUG_LABEL              0x3f
++
++/* TrustZone (same calls as TopazModem's PAS boot, with the GPU's PAS id) */
++#define SCM_FN(svc, cmd)    (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
++#define SCM_SVC_BOOT        0x01
++#define SCM_BOOT_SET_REMOTE_STATE 0x0a
++#define SCM_SVC_PIL         0x02
++#define PIL_INIT_IMAGE      0x01
++#define PIL_MEM_SETUP       0x02
++#define PIL_AUTH_RESET      0x05
++#define PIL_SHUTDOWN        0x06
++#define SCM_ARG_RW          2
++
++/* ---------------------------------------------------------------- firmware table */
++
++/*
++ * Where the GPU firmware lies in a stock partition of this phone, found on the host by
++ * tools/fwtable-vendor.py and checked here by CRC32. Qualcomm's firmware is never copied
++ * into this repository or into the iOS root; the driver reads it from the partition it
++ * already sits in, read only.
++ */
++struct gpu_fw_file {
++	const char *name;
++	const char *part;
++	uint32_t    off, size, crc;
++};
++static const struct gpu_fw_file gpu_fw[] = {
++	/*
++	 * Entries generated by tools/fwtable-vendor.py, for example
++	 *   { "a630_sqe.fw", "vendor_a", 0x1234000, 32504, 0xdeadbeef },
++	 *   { "a610_zap.mdt", "vendor_a", 0x1240000, 6860, 0xdeadbeef },
++	 *   { "a610_zap.b02", "vendor_a", 0x1242000, 2096, 0xdeadbeef },
++	 * The sentinel keeps the array valid while the table is empty.
++	 */
++	{ NULL, NULL, 0, 0, 0 },
++};
++
++/* Does the boot image carry the microcode in its device tree? */
++static bool
++have_adt_firmware(void)
++{
++	DTEntry chosen;
++	void const *blob;
++	unsigned int size;
++
++	return SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	       SecureDTGetProperty(chosen, "gpu-sqe-firmware", &blob, &size) == kSuccess && size > 4;
++}
++
++static unsigned
++fw_count(void)
++{
++	unsigned n = 0;
++	while (n < sizeof(gpu_fw) / sizeof(gpu_fw[0]) && gpu_fw[n].name != NULL) {
++		n++;
++	}
++	return n;
++}
++
++/* ---------------------------------------------------------------- register access */
++
++static IOMemoryMap *gcc_map, *gpucc_map, *gpu_map, *smmu_map, *pool_map, *zap_map;
++static volatile uint8_t *gcc, *gpucc, *gpu, *smmu;
++static uint8_t *pool;
++static uint32_t *ring, *test_buf;
++static uint32_t ring_wptr;
++static unsigned scm_resumes;
++static uint32_t slow_ms;                        /* boot-arg gpu_slow: see step_done() */
++/*
++ * boot-arg gpu_div: the GPLL0 divider for the core clock, 2 = 300 MHz. Nothing here raises
++ * VDD_GFX (Linux does it through the OPP table and RPMh, and there is no GMU to do it for
++ * us), so the rail stays wherever the bootloader left it and 300 MHz may be above what it
++ * holds: a boot that dies with the clocks up and no bus error is the shape that has. gpu_div=8
++ * (75 MHz) is the slowest useful setting; the divider field holds 2 * div - 1.
++ */
++static uint32_t core_div = 2;
++/*
++ * boot-arg gpu_smmu_early: program the identity context bank as soon as its clock is voted,
++ * before the GX domain comes up, instead of in cp_start(). The GPU's SMMU comes out of the
++ * bootloader with every stream faulting, so anything the GPU does on the bus between the GX
++ * domain coming up and cp_start() is a fault with no context bank behind it, and a NoC error
++ * on this SoC resets it without the CPU seeing anything. Off by default: it changes the order
++ * of the one sequence that has worked.
++ */
++static uint32_t smmu_early;
++/*
++ * boot-arg gpu_irq=1 leaves the GPU's interrupt alone; by default it is masked in the GIC
++ * before anything is powered. Three boots have now died in the same place: the step after
++ * the power-up, which only re-reads registers that were just read, with the phone stopping
++ * dead mid-sentence and iOS with it, no panic and no further line. That is not what a bad
++ * register read looks like (that hangs the reader), it is what an interrupt nobody handles
++ * looks like: the GPU's is level triggered, so if it is asserted and enabled in the
++ * distributor the CPU re-takes it forever and nothing ever logs again. Whether it is enabled
++ * at all is the bootloader's business, so the state goes in the log either way.
++ */
++static uint32_t gpu_irq;
++/*
++ * boot-arg gpu_stop=N ends stage 3 early: 1 after the zap shader, 2 once the SQE runs, 3 after
++ * CP_ME_INIT, 4 after CP_SET_SECURE_MODE; 0 (default) runs it all. boot-arg gpu_keep=1 leaves
++ * the GPU running afterwards; by default it is parked (bus drained, GX and CX collapsed), as
++ * Linux does once a GPU goes idle. Both exist for the one stage-3 boot whose panel stopped
++ * taking DSI commands right after the GPU ran ("panel level: NO DONE", the screen filled with
++ * colours), when stage 2 and stage 4 did not: they say which step does it, and whether it
++ * lasts only while the GPU is up.
++ */
++static uint32_t stop_at, keep_running;
++static uint32_t draw_first = 1;                 /* boot-arg gpu_draw=0 skips the 2D fill */
++static bool stopped_early;
++static bool service_ok;                         /* stage 3 and the draw tests passed */
++
++static bool
++stop_here(uint32_t step, const char *what)
++{
++	if (stop_at != step) {
++		return false;
++	}
++	LOG("gpu_stop=%u: stopping after %s", step, what);
++	stopped_early = true;
++	return true;
++}
++static IOMemoryMap *gicd_map;
++static volatile uint8_t *gicd;
++static bool smmu_identity(void);
++
++/*
++ * The persistent log is written to userdata about once a second, so a step that hangs or
++ * panics the phone takes the lines around it with it: the last boot left nothing after
++ * "starting in N s". gpu_slow=N waits N ms after each step, which gives that writer time to
++ * put the step's line on disk before the next one runs. 1200 is a good value.
++ *
++ * Every step of the power-up, the zap shader and the CP ends in one of these, so a boot that
++ * stops dead says in the log which register or which TrustZone call it stopped on.
++ */
++static void
++step_done(void)
++{
++	if (slow_ms != 0) {
++		IOSleep(slow_ms);
++	}
++}
++
++static inline void
++gmb(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint32_t
++rd(volatile uint8_t *b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	gmb();
++	return v;
++}
++
++static void
++wr(volatile uint8_t *b, uint32_t off, uint32_t v)
++{
++	gmb();
++	*(volatile uint32_t *)(b + off) = v;
++	gmb();
++}
++
++static void
++rmw(volatile uint8_t *b, uint32_t off, uint32_t clear, uint32_t set)
++{
++	wr(b, off, (rd(b, off) & ~clear) | set);
++}
++
++/* Wait up to us microseconds for (reg & mask) == want. */
++static bool
++poll(volatile uint8_t *b, uint32_t off, uint32_t mask, uint32_t want, uint32_t us)
++{
++	for (uint32_t i = 0; i <= us; i++) {
++		if ((rd(b, off) & mask) == want) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++/* The GPU's own registers are addressed in dwords in Qualcomm's documentation. */
++static uint32_t
++grd(uint32_t reg)
++{
++	return rd(gpu, 4 * reg);
++}
++
++static void
++gwr(uint32_t reg, uint32_t v)
++{
++	wr(gpu, 4 * reg, v);
++}
++
++static void
++gwr64(uint32_t reg, uint64_t v)
++{
++	gwr(reg, (uint32_t)v);
++	gwr(reg + 1, (uint32_t)(v >> 32));
++}
++
++static IOMemoryMap *
++map_phys(uint64_t pa, uint64_t size, bool ram)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++	IOMemoryMap *m;
++
++	if (md == NULL) {
++		return NULL;
++	}
++	/*
++	 * Registers are device memory (kIOMapInhibitCache). RAM the GPU shares is not: xnu's
++	 * bzero and memcpy use dc zva and vector stores, which are alignment faults on device
++	 * memory ("Unaligned kernel data abort" in bzero, from the first bzero of the pool,
++	 * what stage 3 and 4 died of before). Write-combined is normal non-cacheable memory,
++	 * which is what TopazModem and SweetSurface use for theirs, and the GPU sees every
++	 * store after a dsb with no cache maintenance.
++	 */
++	m = md->map(ram ? kIOMapWriteCombineCache : kIOMapInhibitCache);
++	md->release();
++	return m;
++}
++
++/* ---------------------------------------------------------------- TrustZone */
++
++static uint64_t
++smc(uint64_t a[8])
++{
++	register uint64_t x0 __asm__("x0") = a[0], x1 __asm__("x1") = a[1], x2 __asm__("x2") = a[2],
++	    x3 __asm__("x3") = a[3], x4 __asm__("x4") = a[4], x5 __asm__("x5") = a[5], x6 __asm__("x6") = a[6],
++	    x7 __asm__("x7") = a[7];
++	__asm__ volatile ("smc #0"
++            : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++            :
++            : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
++	return x0;
++}
++
++static uint64_t
++scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
++{
++	uint64_t args[8] = { fn, arginfo, a, b, c, 0, 0, 0 };
++	unsigned n;
++
++	smc(args);
++	/* long calls answer INTERRUPTED (1): resume with x0 = 1 and the session from x6 */
++	for (n = 0; args[0] == 1 && n < 100000; n++) {
++		uint64_t again[8] = { 1, arginfo, a, b, c, 0, args[6], 0 };
++		memcpy(args, again, sizeof(args));
++		smc(args);
++	}
++	scm_resumes = n;
++	if (res1 != NULL) {
++		*res1 = args[1];
++	}
++	return args[0];
++}
++
++/* ---------------------------------------------------------------- clocks and power */
++
++struct reg_desc { uint8_t block, kind; uint32_t off; const char *name; };
++
++static const struct reg_desc clock_regs[] = {
++	{ 0, 1, 0x36004, "gcc_gpu_cfg_ahb" },
++	{ 0, 1, 0x3600c, "gcc_gpu_memnoc_gfx" },
++	{ 0, 1, 0x36018, "gcc_gpu_snoc_dvm_gfx" },
++	{ 0, 1, 0x36100, "gcc_gpu_iref" },
++	{ 0, 1, 0x36048, "gcc_gpu_throttle_core" },
++	{ 0, 0, 0x79004, "gcc_vote (b15 gpll0)" },
++	{ 1, 4, 0x0000,  "gpucc_pll0_mode" },
++	{ 1, 0, 0x0004,  "gpucc_pll0_l" },
++	{ 1, 4, 0x0100,  "gpucc_pll1_mode" },
++	{ 1, 3, 0x101c,  "gpucc_gx_gfx3d_rcg_cmd" },
++	{ 1, 0, 0x1020,  "gpucc_gx_gfx3d_rcg_cfg" },
++	{ 1, 3, 0x1120,  "gpucc_gmu_rcg_cmd" },
++	{ 1, 0, 0x1124,  "gpucc_gmu_rcg_cfg" },
++	{ 1, 1, 0x1004,  "gpucc_cxo_aon" },
++	{ 1, 1, 0x1054,  "gpucc_gx_gfx3d" },
++	{ 1, 1, 0x1060,  "gpucc_gx_cxo" },
++	{ 1, 1, 0x1078,  "gpucc_ahb" },
++	{ 1, 1, 0x1098,  "gpucc_cx_gmu" },
++	{ 1, 1, 0x109c,  "gpucc_cxo" },
++	{ 1, 1, 0x10a4,  "gpucc_cx_gfx3d" },
++	{ 1, 1, 0x5000,  "gpucc_hlos1_vote_gpu_smmu" },
++	{ 1, 2, 0x100c,  "gpucc_gx_gdsc" },
++	{ 1, 2, 0x106c,  "gpucc_cx_gdsc" },
++	{ 1, 0, 0x1508,  "gpucc_gx_clamp_io" },
++	{ 1, 0, 0x1540,  "gpucc_cx_gds_hw_ctrl" },
++};
++
++/* The GPU's line in the distributor: enabled, pending, active. */
++static void
++gic_report(const char *when)
++{
++	if (gicd == NULL) {
++		return;
++	}
++	LOG("  GIC SPI 177 (INTID %u) %s: enabled %u pending %u active %u (words %08x %08x %08x)", GPU_INTID, when,
++	    (rd(gicd, GICD_ISENABLER + GPU_INT_WORD) & GPU_INT_BIT) != 0,
++	    (rd(gicd, GICD_ISPENDR + GPU_INT_WORD) & GPU_INT_BIT) != 0,
++	    (rd(gicd, GICD_ISACTIVER + GPU_INT_WORD) & GPU_INT_BIT) != 0,
++	    rd(gicd, GICD_ISENABLER + GPU_INT_WORD), rd(gicd, GICD_ISPENDR + GPU_INT_WORD),
++	    rd(gicd, GICD_ISACTIVER + GPU_INT_WORD));
++}
++
++/*
++ * Writing a 1 to ICENABLER/ICPENDR clears that interrupt's enable and pending bits and
++ * leaves every other line alone, which is why these registers are a bitmap of ones to act on
++ * rather than a value to store.
++ */
++static void
++gic_mask_gpu(void)
++{
++	if (gicd == NULL) {
++		return;
++	}
++	wr(gicd, GICD_ICENABLER + GPU_INT_WORD, GPU_INT_BIT);
++	wr(gicd, GICD_ICPENDR + GPU_INT_WORD, GPU_INT_BIT);
++	gmb();
++	gic_report("masked");
++}
++
++static void
++dump_clocks(const char *when)
++{
++	LOG("--- clock tree (%s)", when);
++	for (unsigned i = 0; i < sizeof(clock_regs) / sizeof(clock_regs[0]); i++) {
++		const struct reg_desc *r = &clock_regs[i];
++		volatile uint8_t *b = r->block == 0 ? gcc : gpucc;
++		uint32_t v = rd(b, r->off);
++		const char *state = "";
++		switch (r->kind) {
++		case 1: state = (v & CBCR_OFF) ? " off" : " running"; break;
++		case 2: state = (v & GDSC_PWR_ON) ? " PWR_ON" : " collapsed"; break;
++		case 3: state = (v & RCG_ROOT_OFF) ? " root off" : (v & RCG_UPDATE) ? " update pending" : " root on"; break;
++		case 4: state = (v & 1) ? " outctrl" : " unconfigured"; break;
++		default: break;
++		}
++		LOG("  %s %08x%s", r->name, v, state);
++	}
++}
++
++static bool
++branch_on(volatile uint8_t *b, uint32_t off, const char *name)
++{
++	bool ok;
++
++	rmw(b, off, 0, CBCR_EN);
++	ok = poll(b, off, CBCR_OFF, 0, 200);
++	LOG("  %s on: %08x %s", name, rd(b, off), ok ? "running" : "STILL OFF");
++	step_done();
++	return ok;
++}
++
++/*
++ * A GDSC comes up by clearing SW_COLLAPSE and waiting for PWR_ON. The GX domain also needs
++ * its block reset pulsed and its I/O clamp released first; its status is in its own GDSCR,
++ * the CX domain's is in GPU_CC_CX_GDS_HW_CTRL (0x1540).
++ */
++static bool
++gdsc_on(uint32_t gdscr, uint32_t bcr, uint32_t clamp, uint32_t status, const char *name)
++{
++	bool ok;
++
++	if (bcr != 0) {
++		rmw(gpucc, bcr, 0, 1);
++		IODelay(1);
++		rmw(gpucc, bcr, 1, 0);
++	}
++	if (clamp != 0) {
++		rmw(gpucc, clamp, 1, 0);
++	}
++	rmw(gpucc, gdscr, GDSC_COLLAPSE, 0);
++	IODelay(1);
++	ok = poll(gpucc, status, GDSC_PWR_ON, GDSC_PWR_ON, 500);
++	LOG("  %s on: gdscr %08x status %08x %s", name, rd(gpucc, gdscr), rd(gpucc, status),
++	    ok ? "PWR_ON" : "NO PWR_ON");
++	step_done();
++	return ok;
++}
++
++/* Root clock generator: pick a parent and a divider (the register holds 2 * div - 1). */
++static bool
++rcg_set(uint32_t cmd, uint32_t src, uint32_t div, const char *name)
++{
++	bool ok;
++
++	wr(gpucc, cmd + 4, (src << 8) | (2 * div - 1));
++	rmw(gpucc, cmd, 0, RCG_UPDATE);
++	ok = poll(gpucc, cmd, RCG_UPDATE, 0, 500);
++	LOG("  %s src %u div %u (GPLL0/%u = %u MHz): cmd %08x cfg %08x %s", name, src, div, div, 600 / div,
++	    rd(gpucc, cmd), rd(gpucc, cmd + 4), ok ? "updated" : "UPDATE STUCK");
++	step_done();
++	return ok;
++}
++
++static bool
++power_up(void)
++{
++	bool ok = true;
++
++	LOG("--- power up");
++	/* GCC side: GPLL0 to the GPU CC, and the GPU's bus clocks */
++	LOG("  about to vote GPLL0 to the GPU (GCC 79004 = %08x)", rd(gcc, 0x79004));
++	step_done();
++	rmw(gcc, 0x79004, 0, 1u << 15);
++	LOG("  gcc vote 79004 = %08x (gpu_gpll0_clk_src)", rd(gcc, 0x79004));
++	step_done();
++	branch_on(gcc, 0x71154, "gcc_bimc_gpu_axi");
++	branch_on(gcc, 0x3600c, "gcc_gpu_memnoc_gfx");      /* voted branch: may read off until used */
++	branch_on(gcc, 0x36018, "gcc_gpu_snoc_dvm_gfx");
++	/* CX first: the GPU CC cxo/ahb branches live in that domain and stay off before it */
++	if (!gdsc_on(0x106c, 0, 0, 0x1540, "gpu_cx_gdsc")) {
++		return false;
++	}
++	ok &= branch_on(gpucc, 0x109c, "gpucc_cxo");
++	ok &= branch_on(gpucc, 0x1078, "gpucc_ahb");
++	if (!ok) {
++		return false;
++	}
++	rcg_set(0x1120, SRC_GPLL0, 3, "gmu_clk_src");
++	rmw(gpucc, 0x1098, 0xFF0, 0xFF0);                   /* cx_gmu wakeup/sleep delays, as Linux probes */
++	step_done();
++	branch_on(gpucc, 0x1098, "gpucc_cx_gmu");
++	branch_on(gpucc, 0x5000, "gpucc_hlos1_vote_gpu_smmu");
++	if (smmu_early != 0 && smmu != NULL) {
++		LOG("  gpu_smmu_early: the identity bank goes in before the GX domain");
++		smmu_identity();
++		step_done();
++	}
++	/* GX domain, then the core clock from GPLL0 (the GPU CC PLLs are left unconfigured) */
++	if (!gdsc_on(0x100c, 0x1008, 0x1508, 0x100c, "gpu_gx_gdsc")) {
++		return false;
++	}
++	ok &= rcg_set(0x101c, SRC_GPLL0, core_div, "gx_gfx3d_clk_src");
++	rmw(gpucc, 0x1054, 0, (1u << 14) | (1u << 13));     /* force mem core / periph on */
++	step_done();
++	ok &= branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d");
++	branch_on(gpucc, 0x1060, "gpucc_gx_cxo");
++	/* the line three boots have died just after this point */
++	gic_report("with the GPU powered");
++	step_done();
++	return ok;
++}
++
++static void
++power_down(void)
++{
++	LOG("--- power down");
++	rmw(gpucc, 0x1054, CBCR_EN, 0);
++	rmw(gpucc, 0x100c, 0, GDSC_COLLAPSE);
++	rmw(gpucc, 0x1508, 0, 1);
++	rmw(gpucc, 0x1098, CBCR_EN, 0);
++	rmw(gpucc, 0x5000, CBCR_EN, 0);
++	rmw(gpucc, 0x106c, 0, GDSC_COLLAPSE);
++	LOG("  gx gdscr %08x, cx gdscr %08x", rd(gpucc, 0x100c), rd(gpucc, 0x106c));
++}
++
++/*
++ * Linux a6xx_bus_clear_pending_transactions(gx_off = true), which a GPU without a GMU runs
++ * before every power collapse: halt the GX side of GBIF, then new client requests, then all
++ * AXI requests, waiting for each ack, and release the GBIF halt. Collapsing the domains with
++ * the CP's transactions still in flight leaves GBIF wedged mid-transfer, and the memory NoC
++ * the display fetches from with it: the panel underflows to a flat colour and its DSI
++ * commands stop completing. That is what every boot that parked the GPU after its CP had
++ * run did (gpu_stop=3, 4 and the full stage 3), and what neither the zap-only boot nor the
++ * one that left the GPU running did. RBBM_GBIF_HALT stays set; hw_init_regs clears it.
++ */
++static bool
++halt_ack(uint32_t reg, uint32_t mask)
++{
++	for (int i = 0; i < 1000; i++) {
++		if ((grd(reg) & mask) == mask) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++static void
++bus_drain(void)
++{
++	bool gx, client, arb;
++
++	gwr(REG_RBBM_GBIF_HALT, 1);
++	gx = halt_ack(REG_RBBM_GBIF_HALT_ACK, 1);
++	gwr(REG_GBIF_HALT, GBIF_CLIENT_HALT);
++	client = halt_ack(REG_GBIF_HALT_ACK, GBIF_CLIENT_HALT);
++	gwr(REG_GBIF_HALT, GBIF_ARB_HALT);
++	arb = halt_ack(REG_GBIF_HALT_ACK, GBIF_ARB_HALT);
++	gwr(REG_GBIF_HALT, 0);
++	gmb();
++	LOG("  bus drained: GX %s, clients %s, AXI %s (GBIF_HALT_ACK %08x)", gx ? "halted" : "NO ACK",
++	    client ? "halted" : "NO ACK", arb ? "halted" : "NO ACK", grd(REG_GBIF_HALT_ACK));
++}
++
++/* The counter runs off the 19.2 MHz crystal: ~192000 ticks in 10 ms means the GPU is alive. */
++static void
++first_reads(void)
++{
++	uint32_t lo1, hi1, lo2, hi2;
++
++	LOG("--- first GPU reads: about to touch %llx for the first time", GPU_PA);
++	step_done();
++	LOG("  RBBM_STATUS   %08x", grd(REG_RBBM_STATUS));
++	step_done();
++	LOG("  RBBM_INT_0_STATUS %08x (what the GPU is asking for)", grd(REG_RBBM_INT_0_STATUS));
++	if (gpu_irq == 0) {
++		/* and now at the source, not only in the distributor */
++		gwr(REG_RBBM_INT_0_MASK, 0);
++		gwr(REG_RBBM_INT_CLEAR_CMD, 0xFFFFFFFF);
++		gmb();
++		LOG("  interrupts masked at the GPU too: INT_0_STATUS %08x", grd(REG_RBBM_INT_0_STATUS));
++		gic_report("after masking at the GPU");
++	}
++	step_done();
++	LOG("  CP_HW_FAULT   %08x", grd(REG_CP_HW_FAULT));
++	lo1 = grd(REG_CP_ALWAYS_ON_COUNTER);
++	hi1 = grd(REG_CP_ALWAYS_ON_COUNTER + 1);
++	IOSleep(10);
++	lo2 = grd(REG_CP_ALWAYS_ON_COUNTER);
++	hi2 = grd(REG_CP_ALWAYS_ON_COUNTER + 1);
++	LOG("  CP_ALWAYS_ON_COUNTER %08x%08x -> %08x%08x in 10 ms (delta %u, 19.2 MHz = ~192000)",
++	    hi1, lo1, hi2, lo2, lo2 - lo1);
++}
++
++/* ---------------------------------------------------------------- firmware */
++
++/* The same firmware, carried in the device tree by the boot image. */
++static const struct { const char *file, *prop; } adt_fw_map[] = {
++	{ "a630_sqe.fw",  "gpu-sqe-firmware" },
++	{ "a610_zap.mdt", "gpu-zap-metadata" },
++	{ "a610_zap.b02", "gpu-zap-segment" },
++};
++
++static int64_t
++adt_fw_read(const char *name, void *dst, uint32_t max)
++{
++	DTEntry chosen;
++	void const *blob;
++	unsigned int size;
++
++	for (unsigned i = 0; i < sizeof(adt_fw_map) / sizeof(adt_fw_map[0]); i++) {
++		if (strcmp(adt_fw_map[i].file, name) != 0) {
++			continue;
++		}
++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++		    SecureDTGetProperty(chosen, adt_fw_map[i].prop, &blob, &size) != kSuccess) {
++			return -1;
++		}
++		if (size > max) {
++			LOG("  %s: %u bytes in the device tree, no room", name, size);
++			return -1;
++		}
++		memcpy(dst, blob, size);
++		LOG("  %s: %u bytes from the device tree", name, size);
++		return size;
++	}
++	return -1;
++}
++
++/* Read a firmware file into dst. Returns its length, or -1. */
++static int64_t
++fw_read(const char *name, void *dst, uint32_t max)
++{
++	int64_t n = adt_fw_read(name, dst, max);
++
++	if (n >= 0) {
++		return n;
++	}
++	for (unsigned i = 0; i < fw_count(); i++) {
++		if (strcmp(gpu_fw[i].name, name) != 0) {
++			continue;
++		}
++		if (gpu_fw[i].size > max) {
++			LOG("  %s: %u bytes, no room", name, gpu_fw[i].size);
++			return -1;
++		}
++		int err = sweet_ufs_read_part(gpu_fw[i].part, gpu_fw[i].off, dst, gpu_fw[i].size);
++		if (err != 0) {
++			LOG("  %s: read from %s failed: %d", name, gpu_fw[i].part, err);
++			return -1;
++		}
++		uint32_t crc = crc32(0, dst, gpu_fw[i].size);
++		if (crc != gpu_fw[i].crc) {
++			/* TrustZone checks the signature anyway: say so and go on */
++			LOG("  %s: crc32 %08x, expected %08x: not the firmware this table was made for", name, crc,
++			    gpu_fw[i].crc);
++		}
++		return gpu_fw[i].size;
++	}
++	LOG("  %s: not in the firmware table", name);
++	return -1;
++}
++
++/*
++ * The zap shader leaves the GPU's secure mode: TrustZone authenticates it (PAS id 13) and
++ * runs it. Metadata = the whole .mdt; the loadable segment goes to the reserved region the
++ * device tree keeps for it. PAS mem_setup wants a 4 KB-aligned size (Linux mdt_loader does
++ * ALIGN(paddr + memsz, SZ_4K)); an unaligned one is refused with 0xffcfffba.
++ */
++static bool
++zap_load(void)
++{
++	uint8_t *meta = pool + OFF_META;
++	uint64_t meta_pa = POOL_PA + OFF_META, st, res = 0;
++	uint32_t phoff, phnum, min_addr = 0xFFFFFFFFu, max_addr = 0, load_paddr = 0;
++	uint32_t seg_size;
++	int64_t mdt_size;
++	bool found = false;
++
++	LOG("--- zap shader (PAS %u)", GPU_PAS_ID);
++	step_done();
++	mdt_size = fw_read("a610_zap.mdt", meta, POOL_SIZE - OFF_META);
++	if (mdt_size < 52) {
++		return false;
++	}
++	memcpy(&phoff, meta + 28, 4);
++	if (phoff >= (uint32_t)mdt_size) {
++		LOG("  program headers at %x, past the %lld bytes read", phoff, mdt_size);
++		return false;
++	}
++	uint16_t n16;
++	memcpy(&n16, meta + 44, 2);
++	phnum = n16;
++	for (uint32_t i = 0; i < phnum && phoff + 32 * (i + 1) <= (uint32_t)mdt_size; i++) {
++		uint32_t ptype, paddr, memsz, filesz, flags;
++		memcpy(&ptype, meta + phoff + 32 * i, 4);
++		memcpy(&paddr, meta + phoff + 32 * i + 12, 4);
++		memcpy(&filesz, meta + phoff + 32 * i + 16, 4);
++		memcpy(&memsz, meta + phoff + 32 * i + 20, 4);
++		memcpy(&flags, meta + phoff + 32 * i + 24, 4);
++		LOG("  phdr %u type %u paddr %x filesz %u memsz %u flags %08x", i, ptype, paddr, filesz, memsz, flags);
++		if (ptype == 1 && memsz != 0 && ((flags >> 24) & 7) != 2) {   /* PT_LOAD, not the hash segment */
++			if (paddr < min_addr) {
++				min_addr = paddr;
++			}
++			if (((paddr + memsz + 0xFFFu) & ~0xFFFu) > max_addr) {
++				max_addr = (paddr + memsz + 0xFFFu) & ~0xFFFu;
++			}
++			load_paddr = paddr;
++			found = true;
++		}
++	}
++	if (!found || max_addr - min_addr > ZAP_SIZE) {
++		LOG("  unexpected layout (found %d, %x..%x)", found, min_addr, max_addr);
++		return false;
++	}
++
++	/* A half-finished PAS from an earlier try refuses everything: start clean */
++	step_done();
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
++	LOG("  shutdown: ret %llx res %llx", st, res);
++	step_done();
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta_pa, 0, &res);
++	LOG("  init_image: ret %llx res %llx (%lld bytes of metadata at %llx)", st, res, mdt_size, meta_pa);
++	step_done();
++	if (st != 0 || res != 0) {
++		/* already authenticated in this boot: ask TrustZone to resume it */
++		st = scm(SCM_FN(SCM_SVC_BOOT, SCM_BOOT_SET_REMOTE_STATE), 2, 0, GPU_PAS_ID, 0, &res);
++		LOG("  set_remote_state(resume): ret %llx res %llx (0/0 = the zap shader is already up)", st, res);
++		return st == 0 && res == 0;
++	}
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, GPU_PAS_ID, ZAP_PA, max_addr - min_addr, &res);
++	LOG("  mem_setup %llx+%x: ret %llx res %llx", ZAP_PA, max_addr - min_addr, st, res);
++	step_done();
++	if (st != 0 || res != 0) {
++		return false;
++	}
++
++	zap_map = map_phys(ZAP_PA, ZAP_SIZE, true);
++	if (zap_map == NULL) {
++		LOG("  the zap region could not be mapped");
++		return false;
++	}
++	uint8_t *dst = (uint8_t *)zap_map->getVirtualAddress();
++	bzero(dst, ZAP_SIZE);
++	seg_size = ZAP_SIZE - (load_paddr - min_addr);
++	if (fw_read("a610_zap.b02", dst + (load_paddr - min_addr), seg_size) < 0) {
++		return false;
++	}
++	gmb();
++	LOG("  segment loaded at %llx, authenticating", ZAP_PA + (load_paddr - min_addr));
++	step_done();
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, GPU_PAS_ID, 0, 0, &res);
++	LOG("  auth_and_reset: ret %llx res %llx resumes %u", st, res, scm_resumes);
++	step_done();
++	return st == 0 && res == 0;
++}
++
++/* ---------------------------------------------------------------- GPU SMMU */
++
++/*
++ * The GPU's SMMU-500 comes out of the bootloader with every stream faulting. One
++ * pass-through context bank (SCTLR.M = 0) for the GPU's stream makes GPU addresses equal
++ * physical ones, which is all the ring and the buffers below 4 GB need. Real stage-1 page
++ * tables come later, when a user space driver allocates its own buffers.
++ */
++/*
++ * GPU virtual memory: stage-1 page tables in the GPU's SMMU context bank, so the GPU can reach
++ * memory that is not physically contiguous (everything iOS allocates). Boot-arg gpu_mmu=1.
++ *
++ * Format and register values are Linux's: drivers/iommu/io-pgtable-arm.c (ARM_64_LPAE_S1,
++ * 4 KB granule, a walker that is not cache coherent) and drivers/iommu/arm/arm-smmu
++ * (arm_smmu_write_context_bank, with Qualcomm's Adreno write_sctlr). The a610 has
++ * ADRENO_QUIRK_4GB_VA, so the GPU's addresses are 32 bits: T0SZ = 32, the walk starts at level
++ * 1 (VA[31:30], 4 entries), then level 2 (2 MB) and level 3 (4 KB). Output addresses are 36
++ * bits, which covers all of this phone's RAM.
++ *
++ * The tables live in the pool, which is write-combined: the CPU's stores reach RAM at the next
++ * dsb, and the walker reads RAM (TCR IRGN0/ORGN0 = non-cacheable), so no cache maintenance.
++ * Everything that worked with the identity bank stays at VA = PA (the pool, the boot
++ * framebuffer) as 2 MB blocks; other memory gets 4 KB pages anywhere below 4 GB.
++ */
++#define PTE_TYPE_TABLE      3ull                /* also TYPE_PAGE at level 3 */
++#define PTE_TYPE_BLOCK      1ull
++#define PTE_ADDR_MASK       0x0000fffffffff000ull
++/* AttrIndx 0 (MAIR NC), AP_UNPRIV, SH_OS, AF, nG: Linux's prot for non-cached read/write */
++#define PTE_RW_NC           ((1ull << 6) | (2ull << 8) | (1ull << 10) | (1ull << 11))
++#define SMMU_MAIR0          0xf404ff44u         /* NC, WBRWA, device, INC_OWBRWA */
++#define SMMU_TCR            ((2u << 12) | (1u << 23) | 32u)  /* SH0 OS, EPD1, T0SZ 32, TG0 4 KB, NC walks */
++#define SMMU_TCR2           ((7u << 15) | 1u)   /* SEP upstream, PASIZE 36 bits */
++#define SMMU_CBAR_S1        ((1u << 16) | (0xFu << 12) | (3u << 8))  /* S1 trans S2 bypass, WB, NSH */
++#define SMMU_SCTLR_XLATE    (0x1000u | 0x100u | 0x40u | 0x20u | 0x4u | 0x2u | 0x1u)  /* ASIDPNE HUPCF CFIE CFRE AFE TRE M */
++
++static uint32_t mmu;
++static uint32_t pt_used;
++static uint64_t *pt_l1;
++static uint64_t pt_l1_pa;
++
++static uint64_t
++pt_alloc(uint64_t **va)
++{
++	if (pt_used >= PT_PAGES) {
++		return 0;
++	}
++	uint32_t off = OFF_PT + pt_used++ * 4096u;
++	*va = (uint64_t *)(pool + off);
++	bzero(*va, 4096);
++	return POOL_PA + off;
++}
++
++static uint64_t *
++pt_next(uint64_t *e)
++{
++	if (*e == 0) {
++		uint64_t *t;
++		uint64_t pa = pt_alloc(&t);
++		if (pa == 0) {
++			return NULL;
++		}
++		*e = pa | PTE_TYPE_TABLE;
++		return t;
++	}
++	if ((*e & 3) != PTE_TYPE_TABLE) {
++		return NULL;                            /* a block is already there */
++	}
++	return (uint64_t *)(pool + ((*e & PTE_ADDR_MASK) - POOL_PA));
++}
++
++static bool
++map_block_2m(uint64_t va, uint64_t pa)
++{
++	uint64_t *l2 = pt_next(&pt_l1[(va >> 30) & 3]);
++	if (l2 == NULL || va >= (1ull << 32)) {
++		return false;
++	}
++	l2[(va >> 21) & 511] = (pa & ~0x1FFFFFull) | PTE_TYPE_BLOCK | PTE_RW_NC;
++	return true;
++}
++
++static bool
++map_page_4k(uint64_t va, uint64_t pa)
++{
++	uint64_t *l2 = pt_next(&pt_l1[(va >> 30) & 3]);
++	uint64_t *l3 = l2 != NULL ? pt_next(&l2[(va >> 21) & 511]) : NULL;
++	if (l3 == NULL || va >= (1ull << 32)) {
++		return false;
++	}
++	l3[(va >> 12) & 511] = (pa & PTE_ADDR_MASK) | PTE_TYPE_TABLE | PTE_RW_NC;
++	return true;
++}
++
++/* TLBIASID 0, then TLBSYNC and wait for TLBSTATUS.SACTIVE to clear. */
++static bool
++tlb_flush(void)
++{
++	gmb();
++	wr(smmu, 0x8610, 0);
++	wr(smmu, 0x87f0, 0);
++	return poll(smmu, 0x87f4, 1, 0, 1000);
++}
++
++static bool
++smmu_pagetables(void)
++{
++	PE_Video video;
++
++	if (smmu == NULL) {
++		return false;
++	}
++	pt_used = 0;
++	pt_l1_pa = pt_alloc(&pt_l1);
++	bool ok = map_block_2m(POOL_PA, POOL_PA);
++	PE_current_console(&video);
++	uint64_t fb = video.v_baseAddr, fb_end = fb + (uint64_t)video.v_rowBytes * video.v_height;
++	for (uint64_t a = fb & ~0x1FFFFFull; ok && fb != 0 && a < fb_end; a += 0x200000) {
++		ok = map_block_2m(a, a);
++	}
++	if (!ok) {
++		LOG("  SMMU: the identity blocks did not fit the page tables");
++		return false;
++	}
++	gmb();
++	wr(smmu, 0x8000, 0);                        /* CB0 off while it changes */
++	wr(smmu, 0x8058, 0xFFFFFFFF);               /* CB0 FSR: clear */
++	wr(smmu, 0x1800, 1);                        /* CBA2R0: VA64 */
++	wr(smmu, 0x1000, SMMU_CBAR_S1);             /* CBAR0 */
++	wr(smmu, 0x8010, SMMU_TCR2);
++	wr(smmu, 0x8030, SMMU_TCR);
++	wr(smmu, 0x8020, (uint32_t)pt_l1_pa);
++	wr(smmu, 0x8024, (uint32_t)(pt_l1_pa >> 32));  /* TTBR0, ASID 0 */
++	wr(smmu, 0x8028, 0);
++	wr(smmu, 0x802C, 0);                        /* TTBR1 */
++	wr(smmu, 0x8038, SMMU_MAIR0);
++	wr(smmu, 0x803C, 0);
++	gmb();
++	wr(smmu, 0x8000, SMMU_SCTLR_XLATE);
++	gmb();
++	wr(smmu, 0x0C00, 0);                        /* S2CR0: translate through CB0 */
++	wr(smmu, 0x0800, (1u << 31) | (1u << 16));  /* SMR0: SID 0, mask 1 */
++	ok = tlb_flush();
++	LOG("  SMMU page tables: L1 at %llx, %u tables used, identity for the pool and %llx-%llx; CB0 SCTLR %08x TCR %08x TCR2 %08x TTBR0 %08x%08x, TLB sync %s",
++	    pt_l1_pa, pt_used, fb, fb_end, rd(smmu, 0x8000), rd(smmu, 0x8030), rd(smmu, 0x8010), rd(smmu, 0x8024),
++	    rd(smmu, 0x8020), ok ? "done" : "STUCK");
++	return true;
++}
++
++static bool
++smmu_identity(void)
++{
++	if (smmu == NULL) {
++		return false;
++	}
++	wr(smmu, 0x8058, 0xFFFFFFFF);               /* CB0 FSR: clear */
++	wr(smmu, 0x8020, 0);
++	wr(smmu, 0x8024, 0);                        /* TTBR0 */
++	wr(smmu, 0x8030, 0);                        /* TCR */
++	wr(smmu, 0x8010, 0);                        /* TCR2 */
++	wr(smmu, 0x8038, 0);
++	wr(smmu, 0x803C, 0);                        /* MAIR */
++	wr(smmu, 0x1800, 1);                        /* CBA2R0: VA64 */
++	wr(smmu, 0x1000, 0x0001f000);               /* CBAR0 */
++	gmb();
++	wr(smmu, 0x8000, 0xE0);                     /* CB0 SCTLR: M = 0, report faults */
++	gmb();
++	wr(smmu, 0x0C00, 0);                        /* S2CR0: translate through CB0 */
++	wr(smmu, 0x0800, (1u << 31) | (1u << 16));  /* SMR0: SID 0, mask 1 */
++	gmb();
++	LOG("  SMMU: SMR0 %08x S2CR0 %08x CBAR0 %08x CBA2R0 %08x CB0 SCTLR %08x", rd(smmu, 0x800), rd(smmu, 0xC00),
++	    rd(smmu, 0x1000), rd(smmu, 0x1800), rd(smmu, 0x8000));
++	return true;
++}
++
++static void
++smmu_fault(const char *tag)
++{
++	if (smmu == NULL) {
++		return;
++	}
++	LOG("  [%s] SMMU gfsr %08x CB0 SCTLR %08x FSR %08x FAR %08x%08x FSYNR0 %08x", tag, rd(smmu, 0x48),
++	    rd(smmu, 0x8000), rd(smmu, 0x8058), rd(smmu, 0x8064), rd(smmu, 0x8060), rd(smmu, 0x8068));
++}
++
++/* ---------------------------------------------------------------- CP bring-up */
++
++/* The subset of Linux a6xx_gpu.c hw_init the command processor needs to run at all. */
++static void
++hw_init_regs(void)
++{
++	static const uint32_t addr_mode[] = { 0x842, 0xC01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601,
++		                              0xE00, 0xae01, 0xb601, 0xF810 };
++
++	gwr(0x3c45, 0);                             /* GBIF_HALT */
++	(void)grd(0x3c45);
++	gwr(0x16, 0);                               /* RBBM_GBIF_HALT */
++	(void)grd(0x16);
++	gwr(0xF803, 0);                             /* RBBM_SECVID_TSB_CNTL */
++	gwr64(0xF800, 0);                           /* SECVID_TSB_TRUSTED_BASE */
++	gwr(0xF802, 0);                             /* SECVID_TSB_TRUSTED_SIZE */
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		gwr(addr_mode[i], 1);               /* 64-bit addressing in every block */
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		gwr(0x3c03 + i, 0x00071620);        /* GBIF_QSB_SIDE0..3 (a610) */
++	}
++	gwr(0x11, 3);                               /* RBBM_GBIF_CLIENT_QOS_CNTL */
++	gwr64(0xE05, 0x1fffffffff000ull + 0xfc0);   /* UCHE_WRITE_RANGE_MAX */
++	gwr64(0xE09, 0x1fffffffff000ull);           /* UCHE_TRAP_BASE */
++	gwr64(0xE07, 0x1fffffffff000ull);           /* UCHE_WRITE_THRU_BASE */
++	gwr64(0xE0B, 0x100000);                     /* UCHE_GMEM_RANGE_MIN */
++	gwr64(0xE0D, 0x100000 + 0x21000 - 1);       /* UCHE_GMEM_RANGE_MAX: gmem 128K + 4K */
++	gwr(0xE18, 0x804);                          /* UCHE_FILTER_CNTL */
++	gwr(0xE17, 4);                              /* UCHE_CACHE_WAYS */
++	gwr(0x8c2, 0x00800060);                     /* CP_ROQ_THRESHOLDS_2 */
++	gwr(0x8c1, 0x40201b16);                     /* CP_ROQ_THRESHOLDS_1 */
++	gwr(0x8C3, 48);                             /* CP_MEM_POOL_SIZE */
++	gwr(0x9e00, 0x00080000);                    /* PC_DBG_ECO_CNTL: prim fifo threshold */
++	gwr(0x98d, 1);                              /* CP_AHB_CNTL */
++	gwr(0x1f, (1u << 30) | 0x3ffff);            /* RBBM_INTERFACE_HANG_INT_CNTL */
++	gwr(0xe19, 0x81);                           /* UCHE_CLIENT_PF */
++}
++
++/* Type-7 packet header: opcode and count each carry an odd-parity bit. */
++static uint32_t
++par(uint32_t v)
++{
++	return (0x9669u >> (0xFu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^
++	    (v >> 28)))) & 1;
++}
++
++static uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000u | cnt | (par(cnt) << 15) | ((op & 0x7F) << 16) | (par(op) << 23);
++}
++
++/* Type-4 packet header: write cnt registers from reg on, with the same odd-parity bits. */
++static uint32_t
++pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | cnt | (par(cnt) << 7) | ((reg & 0x3FFFF) << 8) | (par(reg) << 27);
++}
++
++static void
++emit(uint32_t v)
++{
++	ring[ring_wptr % RING_DWORDS] = v;
++	ring_wptr++;
++}
++
++/* Publish the write pointer and wait for the CP to catch up. */
++static bool
++submit(const char *what, uint32_t ms)
++{
++	uint32_t wptr = ring_wptr % RING_DWORDS, rptr = 0;
++
++	gmb();
++	gwr(REG_CP_RB_WPTR, wptr);
++	for (uint32_t i = 0; i < ms * 100; i++) {
++		rptr = grd(REG_CP_RB_RPTR);
++		if (rptr == wptr) {
++			LOG("  %s: done (rptr %u) after ~%u us, RBBM_STATUS %08x", what, rptr, i * 10,
++			    grd(REG_RBBM_STATUS));
++			step_done();
++			return true;
++		}
++		IODelay(10);
++	}
++	LOG("  %s: TIMEOUT rptr %u wptr %u RBBM_STATUS %08x INT_0_STATUS %08x CP_HW_FAULT %08x", what, rptr, wptr,
++	    grd(REG_RBBM_STATUS), grd(REG_RBBM_INT_0_STATUS), grd(REG_CP_HW_FAULT));
++	smmu_fault(what);
++	step_done();
++	return false;
++}
++
++/*
++ * Start the command processor and prove it runs: its microcode (a630_sqe.fw without its
++ * first dword, as adreno_fw_create_bo copies it), a 32 KB ring, CP_ME_INIT, then leaving
++ * secure mode, and a CP_MEM_WRITE the CPU reads back from RAM.
++ */
++static bool
++cp_start(bool have_zap)
++{
++	uint8_t *sqe = pool + OFF_SQE;
++	int64_t fw_size;
++
++	LOG("--- CP start");
++	step_done();
++	/* adreno_fw_create_bo copies the firmware from its second dword on */
++	fw_size = fw_read("a630_sqe.fw", sqe, OFF_RING - OFF_SQE);
++	if (fw_size <= 4) {
++		return false;
++	}
++	/* dst is below src, so a forward word copy is the shift */
++	uint32_t *w = (uint32_t *)sqe;
++	for (uint32_t i = 0; i < (uint32_t)(fw_size - 4 + 3) / 4; i++) {
++		w[i] = w[i + 1];
++	}
++	test_buf[0] = 0x11111111;
++	gmb();
++	LOG("  sqe %lld bytes at %llx, ring at %llx, test buffer at %llx", fw_size - 4, POOL_PA + OFF_SQE,
++	    POOL_PA + OFF_RING, POOL_PA + OFF_TEST);
++	step_done();
++
++	if (!(mmu ? smmu_pagetables() : smmu_identity())) {
++		return false;
++	}
++	step_done();
++	hw_init_regs();
++	LOG("  hw_init done: RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++	step_done();
++	gwr64(REG_CP_SQE_INSTR_BASE, POOL_PA + OFF_SQE);
++	gwr64(REG_CP_RB_BASE, POOL_PA + OFF_RING);
++	/* 32 KB ring, 32-byte blocks, the CP does not write the read pointer back to memory */
++	gwr(REG_CP_RB_CNTL, 12 | (2 << 8) | (1u << 27));
++	ring_wptr = 0;
++	gwr(REG_CP_RB_WPTR, 0);
++	gwr(REG_CP_SQE_CNTL, 1);
++	LOG("  SQE started: RBBM_STATUS %08x CP_HW_FAULT %08x rptr %u", grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
++	    grd(REG_CP_RB_RPTR));
++	step_done();
++	if (stop_here(2, "starting the SQE")) {
++		return false;
++	}
++
++	emit(pkt7(CP_ME_INIT, 8));
++	emit(0x2f);
++	emit(3);
++	emit(0x20000000);
++	emit(0);
++	emit(0);
++	emit(0);
++	emit(0);
++	emit(0);
++	if (!submit("CP_ME_INIT", 100)) {
++		return false;
++	}
++	smmu_fault("after CP_ME_INIT");
++	if (stop_here(3, "CP_ME_INIT")) {
++		return false;
++	}
++	if (have_zap) {
++		emit(pkt7(CP_SET_SECURE_MODE, 1));
++		emit(0);
++		if (!submit("CP_SET_SECURE_MODE 0", 100)) {
++			return false;
++		}
++		smmu_fault("after CP_SET_SECURE_MODE");
++		if (stop_here(4, "CP_SET_SECURE_MODE 0")) {
++			return false;
++		}
++	} else {
++		/* no zap shader: tell the hardware directly, and hope the bootloader left it open */
++		gwr(REG_RBBM_SECVID_TRUST_CNTL, 0);
++		LOG("  no zap shader: RBBM_SECVID_TRUST_CNTL = 0, RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++		step_done();
++	}
++	emit(pkt7(CP_MEM_WRITE, 3));
++	emit((uint32_t)(POOL_PA + OFF_TEST));
++	emit((uint32_t)((POOL_PA + OFF_TEST) >> 32));
++	emit(0xC0FFEE00);
++	if (!submit("CP_MEM_WRITE", 100)) {
++		return false;
++	}
++	IODelay(100);
++	gmb();
++	LOG("  test buffer: %08x (c0ffee00 = the GPU wrote it)", test_buf[0]);
++	smmu_fault("after the test");
++	step_done();
++	return test_buf[0] == 0xC0FFEE00;
++}
++
++static void
++reg1(uint32_t reg, uint32_t v)
++{
++	emit(pkt4(reg, 1));
++	emit(v);
++}
++
++static void
++event(uint32_t ev, bool ts)
++{
++	static uint32_t seqno;
++
++	if (!ts) {
++		emit(pkt7(CP_EVENT_WRITE, 1));
++		emit(ev);
++		return;
++	}
++	emit(pkt7(CP_EVENT_WRITE, 4));
++	emit(ev | (1u << 30));                     /* TIMESTAMP: write the seqno below */
++	emit((uint32_t)(POOL_PA + OFF_FENCE));
++	emit((uint32_t)((POOL_PA + OFF_FENCE) >> 32));
++	emit(++seqno);
++}
++
++/*
++ * The 2D blitter, as Mesa's freedreno does a buffer clear: blit_begin() emits the a610's
++ * batch-start registers, cleans and invalidates the CCU, sets render mode BLIT2DSCALE, the CCU
++ * bypass (sysmem) layout, the clear colour and the blit format; blit_rect() emits one
++ * destination and one CP_BLIT(SCALE); blit_end() cleans the CCU and the caches, waits for idle
++ * and submits, so the pixels are in RAM when it returns.
++ */
++static void
++blit_setup(bool solid, uint32_t rgba)
++{
++	uint32_t fmt = FMT6_8_8_8_8_UNORM;
++	uint32_t blt = (0xFu << 20) | (fmt << 8) | (solid ? (1u << 7) : 0);  /* MASK, COLOR_FORMAT, IFMT UNORM8, SOLID_COLOR */
++
++	/* the a610's batch-start registers (freedreno_devices.py magic_regs / raw_magic_regs) */
++	reg1(0x9804, 0xf);                          /* PC_MODE_CNTL */
++	reg1(0x9805, 0);                            /* PC_POWER_CNTL */
++	reg1(0xa0f8, 0);                            /* VFD_POWER_CNTL */
++	reg1(0xb600, 0);                            /* TPL1_DBG_ECO_CNTL */
++	reg1(0x8600, 0);                            /* GRAS_DBG_ECO_CNTL */
++	reg1(0xae03, 0);                            /* SP_CHICKEN_BITS */
++	reg1(0xae00, 0);                            /* SP_DBG_ECO_CNTL */
++	reg1(0xbe04, 0);                            /* HLSQ_DBG_ECO_CNTL */
++	reg1(0x9600, 0);                            /* VPC_DBG_ECO_CNTL */
++	reg1(0x0e12, 0x10000000);                   /* UCHE_UNKNOWN_0E12 */
++	reg1(REG_RB_RBP_CNTL, 1);
++	reg1(REG_RB_DBG_ECO_CNTL, 0x04100000);      /* the same value for blits on a610: no toggling */
++
++	/* emit_setup */
++	event(EV_PC_CCU_FLUSH_COLOR_TS, true);
++	event(EV_PC_CCU_FLUSH_DEPTH_TS, true);
++	event(EV_PC_CCU_INVALIDATE_COLOR, false);
++	event(EV_PC_CCU_INVALIDATE_DEPTH, false);
++	emit(pkt7(CP_SET_MARKER, 1));
++	emit(RM6_BLIT2DSCALE);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	/* sysmem layout: depth cache at 0, colour at num_ccu (1) x 8 KB; fast clear off on gen1_low */
++	reg1(REG_RB_CCU_CNTL, (1u << 0) | ((0x2000u >> 12) << 23));
++
++	/* emit_clear_color (R2D_UNORM8: one byte per dword, in the format's channel order) */
++	if (solid) {
++		emit(pkt4(REG_RB_A2D_CLEAR_COLOR_DW0, 4));
++		emit((rgba >> 24) & 0xff);
++		emit((rgba >> 16) & 0xff);
++		emit((rgba >> 8) & 0xff);
++		emit(rgba & 0xff);
++	}
++	/* emit_blit_setup */
++	reg1(REG_RB_A2D_BLT_CNTL, blt);
++	reg1(REG_GRAS_A2D_BLT_CNTL, blt);
++	reg1(REG_SP_A2D_OUTPUT_INFO, (fmt << 3) | (0xFu << 12));  /* IFMT_TYPE FLOAT, COLOR_FORMAT, MASK */
++	reg1(REG_RB_A2D_PIXEL_CNTL, 0);
++}
++
++static void
++blit_begin(uint32_t rgba)
++{
++	blit_setup(true, rgba);
++}
++
++/* One rectangle [x0, x1] x [y0, y1] of a linear surface: base 64-byte aligned, pitch a multiple of 64. */
++static void
++blit_rect(uint64_t base, uint32_t pitch, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++{
++	emit(pkt4(REG_RB_A2D_DEST_BUFFER_INFO, 4));
++	emit(FMT6_8_8_8_8_UNORM);                   /* TILE6_LINEAR, WZYX */
++	emit((uint32_t)base);
++	emit((uint32_t)(base >> 32));
++	emit(pitch >> 6);
++	emit(pkt4(REG_GRAS_A2D_DEST_TL, 2));
++	emit(x0 | (y0 << 16));
++	emit(x1 | (y1 << 16));
++	/* emit_blit_fini */
++	event(EV_DEBUG_LABEL, false);
++	emit(pkt7(CP_BLIT, 1));
++	emit(BLIT_OP_SCALE);
++}
++
++static bool
++blit_end(const char *what)
++{
++	event(EV_PC_CCU_FLUSH_COLOR_TS, true);
++	event(EV_PC_CCU_FLUSH_DEPTH_TS, true);
++	event(EV_CACHE_FLUSH_TS, true);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	return submit(what, 200);
++}
++
++/*
++ * The first thing the GPU draws: a 256 x 256 RGBA8 solid fill into a buffer the CPU has filled
++ * with a pattern first, then read back pixel by pixel.
++ */
++static bool
++blit_fill(uint32_t rgba)
++{
++	uint32_t *pix = (uint32_t *)(pool + OFF_DRAW);
++	uint32_t good = 0, bad_at = 0xFFFFFFFF, bad_val = 0;
++
++	LOG("--- first draw: 2D blitter, %ux%u RGBA8 at %llx, colour %08x", DRAW_W, DRAW_H, POOL_PA + OFF_DRAW, rgba);
++	for (uint32_t i = 0; i < DRAW_W * DRAW_H; i++) {
++		pix[i] = 0xDEADBEEF;
++	}
++	gmb();
++	blit_begin(rgba);
++	blit_rect(POOL_PA + OFF_DRAW, DRAW_PITCH, 0, 0, DRAW_W - 1, DRAW_H - 1);
++	if (!blit_end("2D fill")) {
++		return false;
++	}
++	IODelay(100);
++	gmb();
++
++	for (uint32_t i = 0; i < DRAW_W * DRAW_H; i++) {
++		if (pix[i] == __builtin_bswap32(rgba)) {
++			good++;
++		} else if (bad_at == 0xFFFFFFFF) {
++			bad_at = i;
++			bad_val = pix[i];
++		}
++	}
++	LOG("  pixels: first %08x, centre %08x, last %08x; %u of %u as expected (%08x in memory)", pix[0],
++	    pix[(DRAW_H / 2) * DRAW_W + DRAW_W / 2], pix[DRAW_W * DRAW_H - 1], good, DRAW_W * DRAW_H,
++	    __builtin_bswap32(rgba));
++	if (bad_at != 0xFFFFFFFF) {
++		LOG("  first wrong pixel: #%u (x %u, y %u) = %08x", bad_at, bad_at % DRAW_W, bad_at / DRAW_W, bad_val);
++	}
++	LOG("  RBBM_STATUS %08x CP_HW_FAULT %08x RBBM_INT_0_STATUS %08x", grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
++	    grd(REG_RBBM_INT_0_STATUS));
++	return good == DRAW_W * DRAW_H;
++}
++
++/*
++ * A copy of a w x h RGBA8 rectangle between two linear surfaces, as Mesa's emit_blit_buffer does
++ * one (TPL1_A2D_SRC_TEXTURE_* for the source, GRAS_A2D_SRC_* its rectangle, then the same
++ * destination and CP_BLIT). Both bases must be 64-byte aligned and both pitches multiples of 64,
++ * so a pitch that is not (the panel's 4320) is split as the demo does: k interleaved surfaces of
++ * pitch k x pitch, each base rounded down to 64 bytes with the difference moved into x.
++ */
++static bool
++blit_copy(uint64_t src, uint32_t spitch, uint64_t dst, uint32_t dpitch, uint32_t w, uint32_t h)
++{
++	uint32_t k = ((spitch | dpitch) & 63) == 0 ? 1 : 2;
++
++	if (((k * spitch) & 63) != 0 || ((k * dpitch) & 63) != 0 || (src & 3) != 0 || (dst & 3) != 0 ||
++	    w + 16 > 0x4000 || h > 2 * 0x3fff) {
++		LOG("  blit_copy: pitches %u/%u or size %ux%u do not fit the blitter", spitch, dpitch, w, h);
++		return false;
++	}
++	blit_setup(false, 0);
++	for (uint32_t j = 0; j < k && j < h; j++) {
++		uint64_t s0 = src + (uint64_t)j * spitch, d0 = dst + (uint64_t)j * dpitch;
++		uint32_t sx = (uint32_t)(s0 & 63) / 4, dx = (uint32_t)(d0 & 63) / 4;
++		uint32_t n = (h - j + k - 1) / k;
++		uint64_t sb = s0 & ~63ull, db = d0 & ~63ull;
++
++		emit(pkt4(REG_TPL1_A2D_SRC_TEXTURE_INFO, 5));        /* INFO, SIZE, BASE lo/hi, PITCH */
++		emit(FMT6_8_8_8_8_UNORM | (1u << 20) | (1u << 22));   /* LINEAR, WZYX, UNK20, UNK22 as Mesa */
++		emit((sx + w) | (n << 15));                           /* WIDTH, HEIGHT */
++		emit((uint32_t)sb);
++		emit((uint32_t)(sb >> 32));
++		emit(((k * spitch) >> 6) << 9);                       /* PITCH, bits 9..23, in 64-byte units */
++		emit(pkt4(REG_GRAS_A2D_SRC_XMIN, 4));
++		emit(sx << 8);
++		emit((sx + w - 1) << 8);
++		emit(0);
++		emit((n - 1) << 8);
++		blit_rect(db, k * dpitch, dx, 0, dx + w - 1, n - 1);
++	}
++	return blit_end("copy");
++}
++
++/*
++ * boot-arg gpu_bench=1: is the GPU worth handing AppleCLCD's per-frame copy? That copy is a
++ * full 1080 x 2400 frame (10 MB) from CoreAnimation's surface into the flip buffer, memcpy then a
++ * cache clean for the MDP, every frame. The GPU writes RAM behind the caches, so taking it over
++ * costs a clean of the source and an invalidate of the destination instead. This times each of
++ * those on the real buffers' sizes, the GPU copy of the boot framebuffer into a contiguous 10 MB
++ * buffer, and checks that copy against its source, row by row.
++ */
++static uint32_t bench;
++extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++extern "C" void sweet_dcache_flush(vm_offset_t addr, unsigned length);
++
++static uint64_t
++us_since(uint64_t t0)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns / 1000;
++}
++
++static void
++bench_copy(void)
++{
++	PE_Video video;
++	IOBufferMemoryDescriptor *a = NULL, *b = NULL;
++
++	PE_current_console(&video);
++	uint32_t w = (uint32_t)video.v_width, h = (uint32_t)video.v_height, dpitch = (uint32_t)video.v_rowBytes;
++	uint32_t spitch = (w * 4 + 511) & ~511u;        /* CoreAnimation's surfaces: 1125 px in 4608 bytes */
++	size_t dsize = (size_t)dpitch * h, ssize = (size_t)spitch * h;
++
++	LOG("--- gpu_bench: one %ux%u frame, source %u bytes a row (%zu), destination %u (%zu)", w, h, spitch,
++	    ssize, dpitch, dsize);
++	a = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, dsize, 0x00000000fffff000ull);
++	b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, ssize, 0x00000000fffff000ull);
++	if (a == NULL || b == NULL || w == 0 || h == 0) {
++		LOG("  no memory for the benchmark");
++		OSSafeReleaseNULL(a);
++		OSSafeReleaseNULL(b);
++		return;
++	}
++	uint8_t *av = (uint8_t *)a->getBytesNoCopy(), *bv = (uint8_t *)b->getBytesNoCopy();
++	uint64_t apa = a->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	uint64_t bpa = b->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	uint64_t t, t_cpy, t_cpy_clean, t_src_clean, t_dst_flush, t_gpu, t_inv;
++	uint32_t bad_rows = 0, first_bad = 0xFFFFFFFF;
++
++	/* the flip path today: memcpy cached -> cached, row by row (pitches differ), then clean for the MDP */
++	memset(bv, 0x5a, ssize);
++	memset(av, 0, dsize);
++	t = mach_absolute_time();
++	for (uint32_t y = 0; y < h; y++) {
++		memcpy(av + (uint64_t)y * dpitch, bv + (uint64_t)y * spitch, (size_t)w * 4);
++	}
++	t_cpy = us_since(t);
++	t = mach_absolute_time();
++	sweet_dcache_clean((vm_offset_t)av, (unsigned)dsize);
++	t_cpy_clean = us_since(t);
++
++	/* a frame as CoreAnimation leaves one: written by the CPU, in its cache; every pixel unique */
++	for (uint32_t y = 0; y < h; y++) {
++		uint32_t *row = (uint32_t *)(bv + (uint64_t)y * spitch);
++		for (uint32_t x = 0; x < w; x++) {
++			row[x] = (y << 12) ^ x ^ 0xA5000000u;
++		}
++	}
++	memset(av, 0x11, dsize);                    /* the destination dirty in the cache too */
++
++	/* the GPU path: clean the source, flush the destination, copy, drop the destination's lines */
++	t = mach_absolute_time();
++	sweet_dcache_clean((vm_offset_t)bv, (unsigned)ssize);
++	t_src_clean = us_since(t);
++	t = mach_absolute_time();
++	sweet_dcache_flush((vm_offset_t)av, (unsigned)dsize);
++	t_dst_flush = us_since(t);
++	t = mach_absolute_time();
++	bool ok = blit_copy(bpa, spitch, apa, dpitch, w, h);
++	t_gpu = us_since(t);
++	t = mach_absolute_time();
++	sweet_dcache_flush((vm_offset_t)av, (unsigned)dsize);
++	t_inv = us_since(t);
++
++	for (uint32_t y = 0; ok && y < h; y++) {
++		if (memcmp(av + (uint64_t)y * dpitch, bv + (uint64_t)y * spitch, (size_t)w * 4) != 0) {
++			if (first_bad == 0xFFFFFFFF) {
++				first_bad = y;
++			}
++			bad_rows++;
++		}
++	}
++	LOG("  CPU today:  copy %llu us + clean %llu us = %llu us a frame", t_cpy, t_cpy_clean, t_cpy + t_cpy_clean);
++	LOG("  GPU copy:   %s in %llu us (submit to idle, the CPU polling), %u of %u rows exactly like the source",
++	    ok ? "done" : "FAILED", t_gpu, ok ? h - bad_rows : 0, h);
++	if (ok && bad_rows) {
++		const uint32_t *gr = (const uint32_t *)(av + (uint64_t)first_bad * dpitch);
++		const uint32_t *sr = (const uint32_t *)(bv + (uint64_t)first_bad * spitch);
++		LOG("  first row that differs: %u: x0 %08x (want %08x), x%u %08x (want %08x)", first_bad, gr[0], sr[0],
++		    w - 1, gr[w - 1], sr[w - 1]);
++	}
++	LOG("  GPU path:   clean source %llu us + flush dest %llu us + GPU %llu us + drop dest %llu us = %llu us a frame",
++	    t_src_clean, t_dst_flush, t_gpu, t_inv, t_src_clean + t_dst_flush + t_gpu + t_inv);
++	OSSafeReleaseNULL(a);
++	OSSafeReleaseNULL(b);
++}
++
++/*
++ * The test GPU virtual memory exists for: 256 KB of ordinary kernel memory, allocated without
++ * asking for contiguity (so scattered over physical pages the way iOS surfaces are), mapped
++ * page by page at one contiguous GPU address, filled by the 2D blitter through that address and
++ * read back by the CPU through its own mapping. The identity bank could never do this.
++ */
++#define MMU_TEST_VA         0x10000000ull       /* below RAM: no overlap with the identity blocks */
++
++static bool
++mmu_test(void)
++{
++	IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut,
++	    DRAW_W * DRAW_H * 4, 4096);
++	uint32_t runs = 0, good = 0, bad_at = 0xFFFFFFFF, bad_val = 0;
++	uint64_t prev = 0, lo = ~0ull, hi = 0;
++	const uint32_t rgba = 0x20C0FFFFu;
++	bool ok = true;
++
++	LOG("--- gpu_mmu: %u KB of scattered memory at GPU address %llx", DRAW_W * DRAW_H * 4 / 1024, MMU_TEST_VA);
++	if (m == NULL) {
++		LOG("  no memory");
++		return false;
++	}
++	uint32_t *cpu = (uint32_t *)m->getBytesNoCopy();
++	for (uint32_t off = 0; ok && off < DRAW_W * DRAW_H * 4; off += 4096) {
++		uint64_t len = 0;
++		uint64_t pa = m->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++		if (pa == 0) {
++			ok = false;
++			break;
++		}
++		if (pa != prev + 4096) {
++			runs++;
++		}
++		prev = pa;
++		lo = pa < lo ? pa : lo;
++		hi = pa > hi ? pa : hi;
++		ok = map_page_4k(MMU_TEST_VA + off, pa);
++	}
++	if (!ok || !tlb_flush()) {
++		LOG("  mapping failed (%u tables used)", pt_used);
++		m->release();
++		return false;
++	}
++	LOG("  %u pages in %u physical runs, between %llx and %llx; %u page tables in use", DRAW_W * DRAW_H * 4 / 4096,
++	    runs, lo, hi + 4095, pt_used);
++	for (uint32_t i = 0; i < DRAW_W * DRAW_H; i++) {
++		cpu[i] = 0xDEADBEEF;
++	}
++	sweet_dcache_flush((vm_offset_t)cpu, DRAW_W * DRAW_H * 4);  /* in RAM, nothing dirty left behind */
++
++	blit_begin(rgba);
++	blit_rect(MMU_TEST_VA, DRAW_PITCH, 0, 0, DRAW_W - 1, DRAW_H - 1);
++	ok = blit_end("2D fill through the GPU MMU");
++	sweet_dcache_flush((vm_offset_t)cpu, DRAW_W * DRAW_H * 4);  /* drop any line the CPU still holds */
++	for (uint32_t i = 0; ok && i < DRAW_W * DRAW_H; i++) {
++		if (cpu[i] == __builtin_bswap32(rgba)) {
++			good++;
++		} else if (bad_at == 0xFFFFFFFF) {
++			bad_at = i;
++			bad_val = cpu[i];
++		}
++	}
++	LOG("  pixels: %u of %u as expected (%08x); first %08x, last %08x", good, DRAW_W * DRAW_H,
++	    __builtin_bswap32(rgba), cpu[0], cpu[DRAW_W * DRAW_H - 1]);
++	if (bad_at != 0xFFFFFFFF) {
++		LOG("  first wrong pixel: #%u (page %u, x %u, y %u) = %08x", bad_at, bad_at * 4 / 4096, bad_at % DRAW_W,
++		    bad_at / DRAW_W, bad_val);
++	}
++	smmu_fault("after the MMU test");
++	m->release();
++	return ok && good == DRAW_W * DRAW_H;
++}
++
++/*
++ * boot-arg gpu_3d=1 (needs gpu_mmu=1): the first 3D draw, replayed. Mesa's Vulkan driver
++ * (turnip), run on a PC under drm-shim impersonating this very a610, recorded one submit:
++ * a clear to dark blue, one textured quad blended source-over (a CoreAnimation layer, in
++ * short) and a blit of the result to a second image. metal/tools/rd2replay.py turned that
++ * capture into SapphireReplay3D.h: every buffer at the GPU address turnip gave it (from
++ * 0x30000000, below RAM, free in our page tables), the non-zero pages and the command
++ * stream. Here those buffers get real pages, the texture is generated (x in red, y in
++ * green), the stream runs as an indirect buffer, and the CPU checks every pixel of both
++ * images. Then the 2D blitter puts the picture on the panel so it can be seen.
++ */
++#include "SapphireReplay3D.h"
++
++#define RP_RT       0x30026000u                 /* render target, BGRA8 256 x 256, pitch 1024 */
++#define RP_TX       0x30066000u                 /* texture, RGBA8 256 x 256 */
++#define RP_DS       0x300a6000u                 /* blit destination */
++#define RP_W        256u
++#define RP_PITCH    1024u
++#define CP_INDIRECT_BUFFER 0x3f
++
++static uint32_t draw3d;
++
++static uint32_t
++rp_check(const uint32_t *img, uint32_t *bad_x, uint32_t *bad_y, uint32_t *bad_v, uint32_t *want)
++{
++	uint32_t good = 0;
++
++	*bad_x = 0xFFFFFFFF;
++	for (uint32_t y = 0; y < RP_W; y++) {
++		for (uint32_t x = 0; x < RP_W; x++) {
++			uint32_t v = img[y * RP_W + x], ok, w;
++			if (x >= 64 && x < 192 && y >= 64 && y < 192) {
++				/* bilinear at texel 2(x-64)+0.5: red and green within one of 2(x-64) */
++				uint32_t r = (v >> 16) & 0xff, g = (v >> 8) & 0xff, er = 2 * (x - 64), eg = 2 * (y - 64);
++				w = 0xff000000u | (er << 16) | (eg << 8);
++				ok = (v >> 24) == 0xff && (v & 0xff) == 0 && r - er <= 1 && g - eg <= 1;
++			} else {
++				w = 0xff000080u;                /* the clear: (0, 0, 0.5, 1) as B, G, R, A bytes */
++				ok = v == w;
++			}
++			if (ok) {
++				good++;
++			} else if (*bad_x == 0xFFFFFFFF) {
++				*bad_x = x;
++				*bad_y = y;
++				*bad_v = v;
++				*want = w;
++			}
++		}
++	}
++	return good;
++}
++
++static bool
++replay_3d(void)
++{
++	const uint32_t span = rp3d_VA_END - rp3d_VA_START;
++	IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut,
++	    span, 4096);
++	uint32_t bx, by, bv, bw;
++	bool ok = true;
++
++	LOG("--- gpu_3d: turnip's clear + textured quad + blit, %u KB of buffers at GPU address %x, %u command streams",
++	    span / 1024, rp3d_VA_START, (unsigned)(sizeof(rp3d_cmds) / sizeof(rp3d_cmds[0])));
++	if (m == NULL) {
++		LOG("  no memory");
++		return false;
++	}
++	uint8_t *cpu = (uint8_t *)m->getBytesNoCopy();
++	bzero(cpu, span);
++	const uint32_t *run = rp3d_page_runs;
++	for (uint32_t p = 0; p < sizeof(rp3d_page_va) / sizeof(rp3d_page_va[0]); p++) {
++		uint32_t *pg = (uint32_t *)(cpu + (rp3d_page_va[p] - rp3d_VA_START));
++		while (*run != 0xFFFFFFFFu) {
++			uint32_t at = run[0], n = run[1];
++			memcpy(pg + at, run + 2, n * 4);
++			run += 2 + n;
++		}
++		run++;
++	}
++	uint32_t *tx = (uint32_t *)(cpu + (RP_TX - rp3d_VA_START));
++	uint32_t *rt = (uint32_t *)(cpu + (RP_RT - rp3d_VA_START));
++	uint32_t *ds = (uint32_t *)(cpu + (RP_DS - rp3d_VA_START));
++	for (uint32_t y = 0; y < RP_W; y++) {
++		for (uint32_t x = 0; x < RP_W; x++) {
++			tx[y * RP_W + x] = 0xff000000u | (y << 8) | x;
++			rt[y * RP_W + x] = 0xDEADBEEF;
++			ds[y * RP_W + x] = 0xDEADBEEF;
++		}
++	}
++	for (uint32_t off = 0; ok && off < span; off += 4096) {
++		uint64_t len = 0, pa = m->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++		ok = pa != 0 && map_page_4k(rp3d_VA_START + off, pa);
++	}
++	if (!ok || !tlb_flush()) {
++		LOG("  mapping failed (%u tables used)", pt_used);
++		m->release();
++		return false;
++	}
++	sweet_dcache_flush((vm_offset_t)cpu, span);
++
++	for (uint32_t i = 0; i < sizeof(rp3d_cmds) / sizeof(rp3d_cmds[0]); i++) {
++		emit(pkt7(CP_INDIRECT_BUFFER, 3));
++		emit(rp3d_cmds[i].va);
++		emit(0);
++		emit(rp3d_cmds[i].dwords);
++	}
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	event(EV_CACHE_FLUSH_TS, true);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	uint64_t t0 = mach_absolute_time();
++	ok = submit("3D replay", 500);
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	sweet_dcache_flush((vm_offset_t)cpu, span);
++	LOG("  submit %s in %llu us; RBBM_STATUS %08x CP_HW_FAULT %08x RBBM_INT_0_STATUS %08x", ok ? "done" : "STUCK",
++	    ns / 1000, grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT), grd(REG_RBBM_INT_0_STATUS));
++	smmu_fault("after the 3D replay");
++	LOG("  render target: (0,0) %08x (128,128) %08x (191,64) %08x (255,255) %08x", rt[0], rt[128 * RP_W + 128],
++	    rt[64 * RP_W + 191], rt[RP_W * RP_W - 1]);
++	uint32_t good_rt = rp_check(rt, &bx, &by, &bv, &bw);
++	LOG("  render target: %u of %u pixels right", good_rt, RP_W * RP_W);
++	if (bx != 0xFFFFFFFF) {
++		LOG("  first wrong: (%u,%u) = %08x, wanted %08x", bx, by, bv, bw);
++	}
++	uint32_t good_ds = rp_check(ds, &bx, &by, &bv, &bw);
++	LOG("  blit copy:     %u of %u pixels right", good_ds, RP_W * RP_W);
++	if (bx != 0xFFFFFFFF) {
++		LOG("  first wrong: (%u,%u) = %08x, wanted %08x", bx, by, bv, bw);
++	}
++
++	/* on the panel, centred, for ten seconds (SpringBoard's next frame covers it) */
++	PE_Video video;
++	PE_current_console(&video);
++	if (ok && video.v_baseAddr != 0 && video.v_width >= RP_W && video.v_height >= RP_W) {
++		uint64_t at = video.v_baseAddr + (uint64_t)((video.v_height - RP_W) / 2) * video.v_rowBytes +
++		    ((video.v_width - RP_W) / 2) * 4u;
++		for (int i = 0; i < 20; i++) {
++			if (!blit_copy(RP_RT, RP_PITCH, at, (uint32_t)video.v_rowBytes, RP_W, RP_W)) {
++				break;
++			}
++			IOSleep(500);
++		}
++	}
++	m->release();
++	return ok && good_rt == RP_W * RP_W && good_ds == RP_W * RP_W;
++}
++
++/*
++ * The GPU as a service (boot-arg gpu_service=1, needs gpu_mmu=1): after its tests the GPU is
++ * not parked, and the rest of the kernel may hand it copies through sapphire_gpu_copy(). One
++ * lock covers the ring, the page tables and the windows. If a copy ever fails or times out the
++ * service turns itself off and every caller falls back to the CPU from then on.
++ *
++ * Sources are IOMemoryDescriptors (iOS surfaces: scattered pages), mapped page by page into
++ * one of four 16 MB windows of GPU addresses from 0x20000000, kept while the same memory comes
++ * back (same descriptor, same length, same first and last physical page) and replaced round
++ * robin otherwise. Destinations are physically contiguous below 4 GB (the panel's flip
++ * buffers) and are mapped at their own physical address, once.
++ */
++#define WIN_BASE            0x20000000ull
++#define WIN_SIZE            0x01000000ull       /* 16 MB: a 1125 x 2436 surface is 10.9 MB */
++#define WIN_COUNT           4u
++
++static uint32_t service;
++static volatile bool service_ready;
++static IOLock *service_lock;
++static struct {
++	IOMemoryDescriptor *md;
++	uint64_t len, first, last;
++} win[WIN_COUNT];
++static uint32_t win_next;
++static struct {
++	uint64_t base, size;
++} ident[4];
++static uint32_t ident_used;
++
++static bool
++map_identity(uint64_t base, uint64_t size)
++{
++	for (uint32_t i = 0; i < ident_used; i++) {
++		if (base >= ident[i].base && base + size <= ident[i].base + ident[i].size) {
++			return true;
++		}
++	}
++	if (ident_used == 4 || base + size > (1ull << 32)) {
++		return false;
++	}
++	for (uint64_t a = base & ~0xFFFull; a < base + size; a += 4096) {
++		uint64_t *l2 = pt_next(&pt_l1[(a >> 30) & 3]);
++		if (l2 == NULL) {
++			return false;
++		}
++		uint64_t e = l2[(a >> 21) & 511];
++		if ((e & 3) == PTE_TYPE_BLOCK && (e & PTE_ADDR_MASK & ~0x1FFFFFull) == (a & ~0x1FFFFFull)) {
++			continue;                       /* already inside an identity block */
++		}
++		if (!map_page_4k(a, a)) {
++			return false;
++		}
++	}
++	ident[ident_used].base = base;
++	ident[ident_used].size = size;
++	ident_used++;
++	return tlb_flush();
++}
++
++static uint64_t
++map_window(IOMemoryDescriptor *md)
++{
++	uint64_t len = md->getLength(), first, last, seg;
++
++	if (len == 0 || len > WIN_SIZE) {
++		return 0;
++	}
++	first = md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++	last = md->getPhysicalSegment((len - 1) & ~0xFFFull, &seg, kIOMemoryMapperNone);
++	for (uint32_t i = 0; i < WIN_COUNT; i++) {
++		if (win[i].md == md && win[i].len == len && win[i].first == first && win[i].last == last) {
++			return WIN_BASE + i * WIN_SIZE;
++		}
++	}
++	uint32_t i = win_next++ % WIN_COUNT;
++	uint64_t va = WIN_BASE + i * WIN_SIZE;
++	for (uint64_t off = 0; off < WIN_SIZE; off += 4096) {
++		uint64_t pa = off < len ? md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone) : 0;
++		if (off < len && pa == 0) {
++			win[i].md = NULL;
++			return 0;
++		}
++		if (pa != 0 && !map_page_4k(va + off, pa)) {
++			win[i].md = NULL;
++			return 0;
++		}
++		if (pa == 0) {
++			/* past the end: no stale page from a previous surface stays reachable */
++			uint64_t *l2 = pt_next(&pt_l1[((va + off) >> 30) & 3]);
++			uint64_t *l3 = l2 != NULL ? pt_next(&l2[((va + off) >> 21) & 511]) : NULL;
++			if (l3 != NULL) {
++				l3[((va + off) >> 12) & 511] = 0;
++			}
++		}
++	}
++	win[i].md = md;
++	win[i].len = len;
++	win[i].first = first;
++	win[i].last = last;
++	return tlb_flush() ? va : 0;
++}
++
++/*
++ * Copy w x h RGBA8 pixels from src (offset src_off, src_pitch bytes a row) to dst_pa (dst_pitch a
++ * row), inside the contiguous destination [dst_base, dst_base + dst_size). The caller has cleaned
++ * the source rows from the CPU caches and invalidates the destination rows after. Returns false
++ * to have the caller copy with the CPU instead.
++ */
++bool sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint64_t dst_pa,
++    uint32_t dst_pitch, uint32_t w, uint32_t h, uint64_t dst_base, uint64_t dst_size);
++bool sapphire_gpu_ready(void);
++
++/* So a caller does not pay for cache maintenance before a copy the GPU would refuse. */
++bool
++sapphire_gpu_ready(void)
++{
++	return service_ready;
++}
++
++bool
++sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint64_t dst_pa,
++    uint32_t dst_pitch, uint32_t w, uint32_t h, uint64_t dst_base, uint64_t dst_size)
++{
++	static uint32_t told;
++	bool ok = false;
++
++	if (!service_ready || src == NULL || w == 0 || h == 0) {
++		return false;
++	}
++	IOLockLock(service_lock);
++	if (service_ready) {
++		uint64_t va = map_window(src);
++		bool dst_ok = map_identity(dst_base, dst_size);
++		if (va != 0 && dst_ok && src_off + (uint64_t)(h - 1) * src_pitch + w * 4u <= src->getLength()) {
++			ok = blit_copy(va + src_off, src_pitch, dst_pa, dst_pitch, w, h);
++			if (!ok) {
++				service_ready = false;
++				LOG("service: a copy failed, the GPU path is off; RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++				smmu_fault("service");
++			}
++		} else if (told++ < 4) {
++			LOG("service: cannot map this copy (window %llx, destination %s, %ux%u at +%llx of %llu bytes)", va,
++			    dst_ok ? "ok" : "NOT mapped", w, h, src_off, src->getLength());
++		}
++	}
++	IOLockUnlock(service_lock);
++	return ok;
++}
++
++/*
++ * boot-arg gpu_cs=1: the first shader on the Adreno — a compute kernel of 64 invocations, each
++ * storing 0xc0de0000 + its local invocation id at buf[id], the buffer's GPU address in c0.xy.
++ * Source metal/ir3/shaders/first.asm, assembled for the a610 by metal/ir3/sapphire-ir3as (Mesa's
++ * own ir3 assembler and encoder): 128 bytes, max_reg 2 (3 full registers), no half registers,
++ * constlen 4 vec4, mergedregs, double_threadsize (THREAD128), branchstack 0, local id in r0.x.
++ * The launch is Mesa's computerator a6xx.cc (cs_restore_emit, cs_program_emit_regs,
++ * cs_program_emit, emit_const, a6xx_emit_grid) for a GPU without LPAC; offsets and fields from
++ * a6xx.xml (metal/tools/a6xx-reg.py).
++ */
++static const uint32_t first_cs[32] = {
++	0x00000000, 0x202cc004, 0x00000001, 0x202cc005, 0xc0de0000, 0x204cc008, 0x00000000, 0x00000500,
++	0x00000008, 0x42100008, 0x00000000, 0x00000500, 0x01800010, 0xc0d60900, 0x00000000, 0x03000000,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++static uint32_t cs_test;
++
++#define REG_SP_PERFCTR_SHADER_MASK  0xae0f
++#define REG_SP_NC_MODE_CNTL_2       0xae04
++#define REG_SP_MODE_CNTL            0xab00
++#define REG_SP_UPDATE_CNTL          0xbb08
++#define REG_SP_CS_CONST_CONFIG      0xb987
++#define REG_SP_CS_CONFIG            0xa9bb
++#define REG_SP_CS_INSTR_SIZE        0xa9bc
++#define REG_SP_CS_CNTL_0            0xa9b0
++#define REG_SP_CS_CNTL_1            0xa9b1
++#define REG_SP_CS_CONST_CONFIG_0    0xb997
++#define REG_SP_CS_WGE_CNTL          0xb998
++#define REG_SP_CS_BASE              0xa9b4
++#define REG_SP_CS_NDRANGE_0         0xb990      /* NDRANGE_0..6 consecutive */
++#define REG_SP_CS_KERNEL_GROUP_X    0xb999      /* X, Y, Z consecutive */
++#define CP_LOAD_STATE6_FRAG         0x34
++#define CP_EXEC_CS                  0x33
++#define RM6_COMPUTE                 8
++#define INVALID_REG                 0xfcu
++
++static bool
++cs_first(void)
++{
++	uint64_t code = POOL_PA + OFF_CS, out = POOL_PA + OFF_CSOUT;
++	volatile uint32_t *res = (volatile uint32_t *)(pool + OFF_CSOUT);
++	uint32_t good = 0, bad_at = 0xFFFFFFFF, bad_val = 0;
++
++	LOG("--- gpu_cs: the first shader, 64 invocations writing to %llx", out);
++	memcpy(pool + OFF_CS, first_cs, sizeof(first_cs));
++	for (int i = 0; i < 64; i++) {
++		res[i] = 0xDEADBEEF;
++	}
++	gmb();
++
++	/* cs_restore_emit: shader mask, NC mode, the a610's magic registers */
++	reg1(REG_SP_PERFCTR_SHADER_MASK, 1u << 5);
++	reg1(REG_SP_NC_MODE_CNTL_2, 0);
++	reg1(0x9804, 0xf);                          /* PC_MODE_CNTL */
++	reg1(0x9805, 0);                            /* PC_POWER_CNTL */
++	reg1(0xa0f8, 0);                            /* VFD_POWER_CNTL */
++	reg1(0xb600, 0);                            /* TPL1_DBG_ECO_CNTL */
++	reg1(0x8600, 0);                            /* GRAS_DBG_ECO_CNTL */
++	reg1(0xae03, 0);                            /* SP_CHICKEN_BITS */
++	reg1(0xae00, 0);                            /* SP_DBG_ECO_CNTL */
++	reg1(0xbe04, 0);                            /* HLSQ_DBG_ECO_CNTL */
++	reg1(0x9600, 0);                            /* VPC_DBG_ECO_CNTL */
++	reg1(0x0e12, 0x10000000);                   /* UCHE_UNKNOWN_0E12 */
++
++	/* cs_program_emit_regs */
++	reg1(REG_SP_MODE_CNTL, 1u | (2u << 1));     /* constant demotion, ISAMMODE_GL */
++	reg1(REG_SP_UPDATE_CNTL, 0x3Fu | (1u << 7)); /* every stage's state, GFX_UAV */
++	reg1(REG_SP_CS_CONST_CONFIG, (4u >> 2) | (1u << 8));  /* constlen 4 vec4 (field shr 2), enabled */
++	reg1(REG_SP_CS_CONFIG, 1u << 8);            /* enabled, no textures, samplers or UAVs */
++	reg1(REG_SP_CS_INSTR_SIZE, 1);              /* instrlen */
++	reg1(REG_SP_CS_CNTL_0, (0u << 1) | (3u << 7) | (0u << 13) | (1u << 20) | (1u << 31));
++	                                            /* half 0, full 3, branchstack 0, THREAD128, mergedregs */
++	reg1(REG_SP_CS_CNTL_1, 1u);                 /* shared_size 1, CONSTLEN_128 */
++	reg1(REG_SP_CS_CONST_CONFIG_0, INVALID_REG | (INVALID_REG << 8) | (INVALID_REG << 16) | (0u << 24));
++	                                            /* no wg id / size / offset consts, local id in r0.x */
++	reg1(REG_SP_CS_WGE_CNTL, INVALID_REG | (1u << 9));  /* no linear local id, THREAD128 */
++	emit(pkt4(REG_SP_CS_BASE, 2));
++	emit((uint32_t)code);
++	emit((uint32_t)(code >> 32));
++	reg1(REG_SP_CS_INSTR_SIZE, 1);
++
++	/* cs_program_emit: preload the code (instrlen 1, within the 64-entry cache) */
++	emit(pkt7(CP_LOAD_STATE6_FRAG, 3));
++	emit(0u | (0u << 14) | (2u << 16) | (0xDu << 18) | (1u << 22));  /* ST6_SHADER, SS6_INDIRECT, SB6_CS_SHADER, 1 unit */
++	emit((uint32_t)code);
++	emit((uint32_t)(code >> 32));
++
++	/* emit_const: c0 = the buffer's address */
++	emit(pkt7(CP_LOAD_STATE6_FRAG, 3 + 4));
++	emit(0u | (1u << 14) | (0u << 16) | (0xDu << 18) | (1u << 22));  /* ST6_CONSTANTS, SS6_DIRECT, SB6_CS_SHADER, 1 vec4 */
++	emit(0);
++	emit(0);
++	emit((uint32_t)out);
++	emit((uint32_t)(out >> 32));
++	emit(0);
++	emit(0);
++
++	/* a6xx_emit_grid: one group of 64 */
++	emit(pkt7(CP_SET_MARKER, 1));
++	emit(RM6_COMPUTE);
++	emit(pkt4(REG_SP_CS_NDRANGE_0, 7));
++	emit(1u | (63u << 2) | (0u << 12) | (0u << 22));  /* kerneldim 1, local size 64 x 1 x 1 */
++	emit(64);                                   /* global size x */
++	emit(0);
++	emit(1);                                    /* global size y */
++	emit(0);
++	emit(1);                                    /* global size z */
++	emit(0);
++	emit(pkt4(REG_SP_CS_KERNEL_GROUP_X, 3));
++	emit(1);
++	emit(1);
++	emit(1);
++	emit(pkt7(CP_EXEC_CS, 4));
++	emit(0);
++	emit(1);
++	emit(1);
++	emit(1);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	event(EV_CACHE_FLUSH_TS, true);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	if (!submit("compute", 200)) {
++		return false;
++	}
++	IODelay(100);
++	gmb();
++	for (uint32_t i = 0; i < 64; i++) {
++		if (res[i] == 0xC0DE0000u + i) {
++			good++;
++		} else if (bad_at == 0xFFFFFFFF) {
++			bad_at = i;
++			bad_val = res[i];
++		}
++	}
++	LOG("  results: [0] %08x [1] %08x [63] %08x; %u of 64 right", res[0], res[1], res[63], good);
++	if (bad_at != 0xFFFFFFFF) {
++		LOG("  first wrong: [%u] = %08x", bad_at, bad_val);
++	}
++	LOG("  RBBM_STATUS %08x CP_HW_FAULT %08x RBBM_INT_0_STATUS %08x", grd(REG_RBBM_STATUS), grd(REG_CP_HW_FAULT),
++	    grd(REG_RBBM_INT_0_STATUS));
++	return good == 64;
++}
++
++/*
++ * boot-arg gpu_demo=1: the GPU paints three bars (red, green, blue) straight onto the boot
++ * framebuffer the panel scans out, over the Apple logo, where they stay until SpringBoard's first
++ * frame replaces them. The framebuffer is 1080 x 2400 BGRA with 4320 bytes a row, which the
++ * blitter cannot take as a pitch (it counts in 64-byte units and 4320 is 67.5 of them), but two
++ * rows are 8640 = 135 x 64: so the even rows are one surface with an 8640-byte pitch, and the odd
++ * rows another one starting 4320 bytes later, whose base is 32 bytes off alignment, so it is
++ * rounded down and x shifted right by 8 pixels, the trick fd6_clear_buffer uses for unaligned
++ * buffers. Two blits per bar.
++ */
++static uint32_t demo;
++
++static bool
++blit_bar(uint64_t fb, uint32_t stride, uint32_t w, uint32_t y0, uint32_t h, uint32_t r, uint32_t g, uint32_t b)
++{
++	/* the framebuffer is B,G,R,A in memory: channel order of the blit format is R,G,B,A */
++	uint32_t rgba = (b << 24) | (g << 16) | (r << 8) | 0xFF;
++	uint64_t even = fb + (uint64_t)y0 * stride;
++	uint64_t odd = even + stride;
++	uint32_t dx = (uint32_t)(odd & 63) / 4;
++
++	blit_begin(rgba);
++	blit_rect(even, 2 * stride, 0, 0, w - 1, h / 2 - 1);
++	blit_rect(odd & ~63ull, 2 * stride, dx, 0, dx + w - 1, h / 2 - 1);
++	return blit_end("bar");
++}
++
++static void
++demo_bars(void)
++{
++	PE_Video video;
++
++	PE_current_console(&video);
++	uint64_t fb = video.v_baseAddr;
++	uint32_t w = (uint32_t)video.v_width, h = (uint32_t)video.v_height, stride = (uint32_t)video.v_rowBytes;
++
++	LOG("--- gpu_demo: bars onto the framebuffer at %llx, %ux%u, %u bytes a row", fb, w, h, stride);
++	if (fb == 0 || (fb & 63) != 0 || ((2 * stride) & 63) != 0 || (stride & 3) != 0 || w > 0x3ff0 || h < 1400) {
++		LOG("  this framebuffer does not fit the two-surface trick; no demo");
++		return;
++	}
++	uint32_t bar = 200, top = h / 2 - 3 * bar / 2;
++	top &= ~1u;                                  /* even first row */
++	bool ok = blit_bar(fb, stride, w, top, bar, 0xFF, 0x20, 0x20) &&
++	    blit_bar(fb, stride, w, top + bar, bar, 0x20, 0xE0, 0x20) &&
++	    blit_bar(fb, stride, w, top + 2 * bar, bar, 0x20, 0x40, 0xFF);
++	LOG("  %s: rows %u-%u red, green, blue", ok ? "drawn" : "FAILED", top, top + 3 * bar - 1);
++
++	/* read a pixel of every bar on an even and an odd row back through the CPU */
++	IOMemoryMap *m = map_phys(fb, (uint64_t)stride * h, true);
++	if (m == NULL) {
++		return;
++	}
++	const uint8_t *v = (const uint8_t *)m->getVirtualAddress();
++	for (uint32_t i = 0; i < 3; i++) {
++		uint32_t ye = top + i * bar + 10, yo = ye + 1;
++		LOG("  bar %u: pixel (%u,%u) %08x, (%u,%u) %08x, (0,%u) %08x, (%u,%u) %08x", i, w / 2, ye,
++		    *(const volatile uint32_t *)(v + (uint64_t)ye * stride + (w / 2) * 4), w / 2, yo,
++		    *(const volatile uint32_t *)(v + (uint64_t)yo * stride + (w / 2) * 4), yo,
++		    *(const volatile uint32_t *)(v + (uint64_t)yo * stride), w - 1, yo,
++		    *(const volatile uint32_t *)(v + (uint64_t)yo * stride + (w - 1) * 4));
++	}
++	m->release();
++}
++
++/* ---------------------------------------------------------------- bring-up thread */
++
++static void
++gpu_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t stage = 0, delay_s = 0;
++
++	(void)PE_parse_boot_argn("gpu", &stage, sizeof(stage));
++	/*
++	 * gpu_delay=N waits N seconds before touching anything. The bring-up runs from
++	 * AppleCLCD::start, long before USB networking carries the console, so its log would
++	 * only be readable from recovery; with a delay it lands in the live log instead.
++	 */
++	(void)PE_parse_boot_argn("gpu_slow", &slow_ms, sizeof(slow_ms));
++	if (PE_parse_boot_argn("gpu_div", &core_div, sizeof(core_div)) && (core_div < 2 || core_div > 16)) {
++		core_div = 2;
++	}
++	(void)PE_parse_boot_argn("gpu_smmu_early", &smmu_early, sizeof(smmu_early));
++	(void)PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
++	(void)PE_parse_boot_argn("gpu_stop", &stop_at, sizeof(stop_at));
++	(void)PE_parse_boot_argn("gpu_keep", &keep_running, sizeof(keep_running));
++	(void)PE_parse_boot_argn("gpu_draw", &draw_first, sizeof(draw_first));
++	(void)PE_parse_boot_argn("gpu_demo", &demo, sizeof(demo));
++	(void)PE_parse_boot_argn("gpu_bench", &bench, sizeof(bench));
++	(void)PE_parse_boot_argn("gpu_cs", &cs_test, sizeof(cs_test));
++	(void)PE_parse_boot_argn("gpu_3d", &draw3d, sizeof(draw3d));
++	(void)PE_parse_boot_argn("gpu_mmu", &mmu, sizeof(mmu));
++	(void)PE_parse_boot_argn("gpu_service", &service, sizeof(service));
++	service_lock = IOLockAlloc();
++	if (PE_parse_boot_argn("gpu_delay", &delay_s, sizeof(delay_s)) && delay_s != 0) {
++		LOG("starting in %u s", delay_s);
++		IOSleep(delay_s * 1000);
++	}
++	LOG("stage %u (Adreno 610 v2, regs %llx, GPU CC %llx), core GPLL0/%u = %u MHz, %u ms after each step",
++	    stage, GPU_PA, GPUCC_PA, core_div, 600 / core_div, slow_ms);
++
++	gcc_map = map_phys(GCC_PA, GCC_SIZE, false);
++	gpucc_map = map_phys(GPUCC_PA, GPUCC_SIZE, false);
++	if (gcc_map == NULL || gpucc_map == NULL) {
++		LOG("the clock controllers could not be mapped");
++		thread_terminate(current_thread());
++		return;
++	}
++	gcc = (volatile uint8_t *)gcc_map->getVirtualAddress();
++	gpucc = (volatile uint8_t *)gpucc_map->getVirtualAddress();
++	gicd_map = map_phys(GICD_PA, GICD_SIZE, false);
++	if (gicd_map != NULL) {
++		gicd = (volatile uint8_t *)gicd_map->getVirtualAddress();
++	}
++	gic_report("as the bootloader left it");
++	dump_clocks("as the bootloader left it");
++	if (stage < 2) {
++		thread_terminate(current_thread());
++		return;
++	}
++
++	if (gpu_irq == 0) {
++		gic_mask_gpu();
++		step_done();
++	}
++	/* mapped before the power-up only so gpu_smmu_early has it; the registers need the vote */
++	smmu_map = map_phys(SMMU_PA, SMMU_SIZE, false);
++	if (smmu_map != NULL) {
++		smmu = (volatile uint8_t *)smmu_map->getVirtualAddress();
++	}
++	if (!power_up()) {
++		LOG("power-up failed, the GPU stays off");
++		power_down();
++		thread_terminate(current_thread());
++		return;
++	}
++	dump_clocks("powered");
++	gpu_map = map_phys(GPU_PA, GPU_SIZE, false);
++	if (gpu_map == NULL) {
++		LOG("the GPU registers could not be mapped");
++		power_down();
++		thread_terminate(current_thread());
++		return;
++	}
++	gpu = (volatile uint8_t *)gpu_map->getVirtualAddress();
++	LOG("GPU registers mapped");
++	step_done();
++	first_reads();
++	if (stage < 3) {
++		LOG("stage 2: the GPU is powered and answering; stopping here");
++		thread_terminate(current_thread());
++		return;
++	}
++
++	if (fw_count() == 0 && !have_adt_firmware()) {
++		LOG("no firmware, in the device tree or in a table: stopping after the power-up");
++		thread_terminate(current_thread());
++		return;
++	}
++	pool_map = map_phys(POOL_PA, POOL_SIZE, true);
++	if (pool_map == NULL || smmu_map == NULL) {
++		LOG("the buffer pool or the SMMU could not be mapped");
++		power_down();
++		thread_terminate(current_thread());
++		return;
++	}
++	pool = (uint8_t *)pool_map->getVirtualAddress();
++	ring = (uint32_t *)(pool + OFF_RING);
++	test_buf = (uint32_t *)(pool + OFF_TEST);
++	bzero(pool, OFF_META + 0x4000);
++
++	/* a partition carries the firmware: sweet_ufs answers EAGAIN until the root device is up */
++	for (int i = 0; fw_count() != 0 && i < 120; i++) {
++		uint8_t probe[16];
++		int err = sweet_ufs_read_part(gpu_fw[0].part, gpu_fw[0].off, probe, sizeof(probe));
++		if (err != EAGAIN) {
++			if (err != 0) {
++				LOG("partition %s: %d", gpu_fw[0].part, err);
++				thread_terminate(current_thread());
++				return;
++			}
++			break;
++		}
++		IOSleep(500);
++	}
++
++	if (stage == 3 && !zap_load()) {
++		LOG("the zap shader did not load; gpu=4 tries it without one");
++		thread_terminate(current_thread());
++		return;
++	}
++	if (stage == 3 && stop_here(1, "the zap shader")) {
++		;
++	} else if (cp_start(stage == 3)) {
++		LOG("*** the GPU executes commands ***");
++		if (draw_first && blit_fill(0xFF8000FF)) {
++			LOG("*** the GPU drew: every pixel of the 2D fill is right ***");
++			service_ok = true;
++			if (demo) {
++				demo_bars();
++			}
++			if (bench) {
++				bench_copy();
++			}
++			if (cs_test && cs_first()) {
++				LOG("*** the first shader ran on the Adreno: 64 of 64 invocations wrote their value ***");
++			} else if (cs_test) {
++				LOG("the compute shader did not come out right");
++			}
++			if (mmu && mmu_test()) {
++				LOG("*** the GPU reached scattered memory through its own page tables ***");
++			} else if (mmu) {
++				LOG("the GPU MMU test did not come out right");
++				service_ok = false;
++			}
++			if (mmu && draw3d && service_ok && replay_3d()) {
++				LOG("*** the first 3D draw on the Adreno: clear, textured quad and blit, every pixel right ***");
++			} else if (mmu && draw3d) {
++				LOG("the 3D replay did not come out right");
++			}
++		} else if (draw_first) {
++			LOG("the 2D fill did not come out right");
++		}
++	} else if (!stopped_early) {
++		LOG("the command processor did not come up");
++	}
++	if (service && mmu && service_lock != NULL && service_ok) {
++		service_ready = true;
++		LOG("*** gpu_service: the GPU stays up and takes copies (%u page tables in use) ***", pt_used);
++	} else if (keep_running || service) {
++		LOG("%s: the GPU stays up%s", service ? "gpu_service" : "gpu_keep=1",
++		    service ? " but takes no work (needs gpu_mmu=1 and every test passed)" : "");
++	} else {
++		LOG("parking the GPU: RBBM_STATUS %08x", grd(REG_RBBM_STATUS));
++		bus_drain();
++		power_down();
++	}
++	thread_terminate(current_thread());
++}
++
++void
++sapphire_gpu_init(void)
++{
++	uint32_t stage = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("gpu", &stage, sizeof(stage)) || stage == 0) {
++		return;
++	}
++	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++#else  /* !ARM64_BOARD_CONFIG_SWEET */
++
++extern "C" void sapphire_gpu_init(void) {}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SapphireReplay3D.h b/iokit/Kernel/arm/SapphireReplay3D.h
+new file mode 100644
+index 0000000..294dcce
+--- /dev/null
++++ b/iokit/Kernel/arm/SapphireReplay3D.h
+@@ -0,0 +1,298 @@
++/* generated by metal/tools/rd2replay.py from draw.rd: chip 6010001, do not edit */
++#define rp3d_VA_START 0x30000000u
++#define rp3d_VA_END 0x300f1000u
++static const struct { uint32_t va, size; } rp3d_bos[] = {
++	{ 0x30000000, 0x5000 },
++	{ 0x30005000, 0x20000 },
++	{ 0x30025000, 0x1000 },
++	{ 0x30026000, 0x40000 },
++	{ 0x30066000, 0x40000 }, /* generated */
++	{ 0x300a6000, 0x40000 },
++	{ 0x300e6000, 0x1000 },
++	{ 0x300e7000, 0x4000 },
++	{ 0x300eb000, 0x4000 },
++	{ 0x300ef000, 0x2000 },
++};
++static const struct { uint32_t va, dwords; } rp3d_cmds[] = {
++	{ 0x300e7000, 288 },
++};
++static const uint32_t rp3d_page_va[9] = {
++	0x30000000,
++	0x30004000,
++	0x30005000,
++	0x30006000,
++	0x30025000,
++	0x300e6000,
++	0x300e7000,
++	0x300eb000,
++	0x300ef000,
++};
++/* each page as runs: (dword index, count, values...), ended by 0xffffffff */
++static const uint32_t rp3d_page_runs[] = {
++	/* 30000000 */
++	1, 11, 0x204cc003, 0x3f800000, 0x204cc004, 0x00000010, 0x202cc007, 0x30001004, 0x64800901, 0x30021006,
++		0x64800905, 0x00000000, 0x03000000,
++	32, 18, 0x10240000, 0x43900000, 0x00000000, 0x204cc008, 0x3f800000, 0x204cc009, 0x00000000, 0x204cc005,
++		0x00000000, 0x00000200, 0x0047b000, 0xc0260001, 0x00000001, 0x300cc006, 0x00000002, 0x200cc007,
++		0x00000000, 0x03000000,
++	64, 10, 0x00000003, 0x202cc001, 0x00000002, 0x202cc004, 0x3f800000, 0x204cc005, 0x30001004, 0x64800902,
++		0x00000000, 0x03000000,
++	96, 8, 0x00002000, 0x47308902, 0x00000000, 0x00000500, 0x00000005, 0xa0c05f00, 0x00000000, 0x13000000,
++	128, 16, 0x00002001, 0x47300003, 0x00002000, 0x47300002, 0x00002002, 0x47308800, 0x00000003, 0x200cc001,
++		0x00020002, 0x240cc000, 0x00000000, 0x00000500, 0x00000001, 0xa0c15f00, 0x00000000, 0x13000000,
++	160, 6, 0x00002000, 0x47300003, 0x00002001, 0x47308000, 0x00000004, 0x2008c001,
++	168, 18, 0x00000003, 0x20054003, 0x00000000, 0x20054000, 0x00000001, 0x200cc002, 0x00000000, 0x00000100,
++		0x00000000, 0x200cc001, 0x00000003, 0x200cc000, 0x00000000, 0x00000500, 0x00000001, 0xa0805f00,
++		0x00000000, 0x13000000,
++	225, 1, 0x03000000,
++	257, 9, 0x202cc000, 0x00000001, 0x202cc001, 0x00000002, 0x202cc002, 0x00000003, 0x202cc003, 0x00000000,
++		0x03000000,
++	289, 17, 0x202cc000, 0x00000001, 0x202cc001, 0x00000002, 0x202cc002, 0x00000003, 0x202cc003, 0x00000004,
++		0x202cc004, 0x00000005, 0x202cc005, 0x00000006, 0x202cc006, 0x00000007, 0x202cc007, 0x00000000,
++		0x03000000,
++	321, 25, 0x202cc000, 0x00000001, 0x202cc001, 0x00000002, 0x202cc002, 0x00000003, 0x202cc003, 0x00000004,
++		0x202cc004, 0x00000005, 0x202cc005, 0x00000006, 0x202cc006, 0x00000007, 0x202cc007, 0x00000008,
++		0x202cc008, 0x00000009, 0x202cc009, 0x0000000a, 0x202cc00a, 0x0000000b, 0x202cc00b, 0x00000000,
++		0x03000000,
++	385, 33, 0x202cc000, 0x00000001, 0x202cc001, 0x00000002, 0x202cc002, 0x00000003, 0x202cc003, 0x00000004,
++		0x202cc004, 0x00000005, 0x202cc005, 0x00000006, 0x202cc006, 0x00000007, 0x202cc007, 0x00000008,
++		0x202cc008, 0x00000009, 0x202cc009, 0x0000000a, 0x202cc00a, 0x0000000b, 0x202cc00b, 0x0000000c,
++		0x202cc00c, 0x0000000d, 0x202cc00d, 0x0000000e, 0x202cc00e, 0x0000000f, 0x202cc00f, 0x00000000,
++		0x03000000,
++	449, 41, 0x202cc000, 0x00000001, 0x202cc001, 0x00000002, 0x202cc002, 0x00000003, 0x202cc003, 0x00000004,
++		0x202cc004, 0x00000005, 0x202cc005, 0x00000006, 0x202cc006, 0x00000007, 0x202cc007, 0x00000008,
++		0x202cc008, 0x00000009, 0x202cc009, 0x0000000a, 0x202cc00a, 0x0000000b, 0x202cc00b, 0x0000000c,
++		0x202cc00c, 0x0000000d, 0x202cc00d, 0x0000000e, 0x202cc00e, 0x0000000f, 0x202cc00f, 0x00000010,
++		0x202cc010, 0x00000011, 0x202cc011, 0x00000012, 0x202cc012, 0x00000013, 0x202cc013, 0x00000000,
++		0x03000000,
++	513, 49, 0x202cc000, 0x00000001, 0x202cc001, 0x00000002, 0x202cc002, 0x00000003, 0x202cc003, 0x00000004,
++		0x202cc004, 0x00000005, 0x202cc005, 0x00000006, 0x202cc006, 0x00000007, 0x202cc007, 0x00000008,
++		0x202cc008, 0x00000009, 0x202cc009, 0x0000000a, 0x202cc00a, 0x0000000b, 0x202cc00b, 0x0000000c,
++		0x202cc00c, 0x0000000d, 0x202cc00d, 0x0000000e, 0x202cc00e, 0x0000000f, 0x202cc00f, 0x00000010,
++		0x202cc010, 0x00000011, 0x202cc011, 0x00000012, 0x202cc012, 0x00000013, 0x202cc013, 0x00000014,
++		0x202cc014, 0x00000015, 0x202cc015, 0x00000016, 0x202cc016, 0x00000017, 0x202cc017, 0x00000000,
++		0x03000000,
++	577, 57, 0x202cc000, 0x00000001, 0x202cc001, 0x00000002, 0x202cc002, 0x00000003, 0x202cc003, 0x00000004,
++		0x202cc004, 0x00000005, 0x202cc005, 0x00000006, 0x202cc006, 0x00000007, 0x202cc007, 0x00000008,
++		0x202cc008, 0x00000009, 0x202cc009, 0x0000000a, 0x202cc00a, 0x0000000b, 0x202cc00b, 0x0000000c,
++		0x202cc00c, 0x0000000d, 0x202cc00d, 0x0000000e, 0x202cc00e, 0x0000000f, 0x202cc00f, 0x00000010,
++		0x202cc010, 0x00000011, 0x202cc011, 0x00000012, 0x202cc012, 0x00000013, 0x202cc013, 0x00000014,
++		0x202cc014, 0x00000015, 0x202cc015, 0x00000016, 0x202cc016, 0x00000017, 0x202cc017, 0x00000018,
++		0x202cc018, 0x00000019, 0x202cc019, 0x0000001a, 0x202cc01a, 0x0000001b, 0x202cc01b, 0x00000000,
++		0x03000000,
++	673, 65, 0x202cc000, 0x00000001, 0x202cc001, 0x00000002, 0x202cc002, 0x00000003, 0x202cc003, 0x00000004,
++		0x202cc004, 0x00000005, 0x202cc005, 0x00000006, 0x202cc006, 0x00000007, 0x202cc007, 0x00000008,
++		0x202cc008, 0x00000009, 0x202cc009, 0x0000000a, 0x202cc00a, 0x0000000b, 0x202cc00b, 0x0000000c,
++		0x202cc00c, 0x0000000d, 0x202cc00d, 0x0000000e, 0x202cc00e, 0x0000000f, 0x202cc00f, 0x00000010,
++		0x202cc010, 0x00000011, 0x202cc011, 0x00000012, 0x202cc012, 0x00000013, 0x202cc013, 0x00000014,
++		0x202cc014, 0x00000015, 0x202cc015, 0x00000016, 0x202cc016, 0x00000017, 0x202cc017, 0x00000018,
++		0x202cc018, 0x00000019, 0x202cc019, 0x0000001a, 0x202cc01a, 0x0000001b, 0x202cc01b, 0x0000001c,
++		0x202cc01c, 0x0000001d, 0x202cc01d, 0x0000001e, 0x202cc01e, 0x0000001f, 0x202cc01f, 0x00000000,
++		0x03000000,
++	0xffffffff,
++	/* 30004000 */
++	86, 1, 0x00000001,
++	89, 1, 0xffffffff,
++	0xffffffff,
++	/* 30005000 */
++	0, 2, 0x40a00201, 0x0000fcfc,
++	32, 3, 0x48a00302, 0xfcfcfcfc, 0x000000fc,
++	64, 2, 0x48a00501, 0x0000fcfc,
++	97, 1, 0x03000000,
++	128, 38, 0x70dc8014, 0x0000a980, 0x81000000, 0x0000ab05, 0x00000001, 0x0000a982, 0x00000000, 0x0000a983,
++		0x30005180, 0x0000a984, 0x00000000, 0x0000a985, 0x00000000, 0x0000a986, 0x00000000, 0x0000a987,
++		0x00000000, 0x0000a988, 0x00000000, 0x0000a9a9, 0x00000000, 0x48a00601, 0x00000000, 0x40980601,
++		0x00000000, 0x40a99e01, 0x00000008, 0x40b98285, 0x00000007, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc,
++		0x0000fcfc, 0x48b98001, 0x00000000, 0x40800501, 0x00000000, 0x48880902,
++	168, 24, 0x40881001, 0x00000000, 0x40810101, 0x00000000, 0x48810901, 0x00000000, 0x40921204, 0xffffffff,
++		0xffffffff, 0xffffffff, 0xffffffff, 0x40930401, 0xff00ff00, 0x40a98c01, 0xfcfcfc00, 0x48a98b01,
++		0x00000000, 0x40880b01, 0x00000000, 0x40880d01, 0x00000000, 0x70348003, 0x00720000, 0x30005180,
++	257, 1, 0x03000000,
++	288, 38, 0x70dc8014, 0x0000a980, 0x81000000, 0x0000ab05, 0x00000001, 0x0000a982, 0x00000000, 0x0000a983,
++		0x30005400, 0x0000a984, 0x00000000, 0x0000a985, 0x00000000, 0x0000a986, 0x00000000, 0x0000a987,
++		0x00000000, 0x0000a988, 0x00000000, 0x0000a9a9, 0x00000000, 0x48a00601, 0x00000000, 0x40980601,
++		0x00000000, 0x40a99e01, 0x00000008, 0x40b98285, 0x00000007, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc,
++		0x0000fcfc, 0x48b98001, 0x00000000, 0x40800501, 0x00000000, 0x48880902,
++	328, 24, 0x40881001, 0x00000000, 0x40810101, 0x00000000, 0x48810901, 0x00000000, 0x40921204, 0xffffffff,
++		0xffffffff, 0xffffffff, 0xffffffff, 0x40930401, 0xff00ff00, 0x40a98c01, 0xfcfcfc00, 0x48a98b01,
++		0x00000000, 0x40880b01, 0x00000000, 0x40880d01, 0x00000000, 0x70348003, 0x00720000, 0x30005400,
++	416, 14, 0x0000000a, 0x03820000, 0x00000009, 0x02820000, 0x000007e0, 0x20244901, 0x00000000, 0x00000100,
++		0x400117e2, 0x40180901, 0x00000000, 0x00000400, 0x01800002, 0xc7060000,
++	432, 24, 0x01800004, 0xc7060001, 0x00000000, 0x14021000, 0x20010000, 0x4b900001, 0x20010000, 0x47100000,
++		0x00000000, 0x204cc006, 0x3f800000, 0x204cc007, 0x00000001, 0x20144002, 0x00000000, 0x20144003,
++		0x00000000, 0x00000100, 0x17e01000, 0x63810004, 0x17e11001, 0x63818005, 0x00000000, 0x03000000,
++	480, 14, 0x0000000a, 0x03820000, 0x00000009, 0x02820000, 0x000007e0, 0x20244901, 0x00000000, 0x00000100,
++		0x400117e2, 0x40180901, 0x00000000, 0x00000400, 0x01800002, 0xc7060000,
++	496, 24, 0x01800004, 0xc7060001, 0x00000000, 0x14021000, 0x20010000, 0x4b900001, 0x20010000, 0x47100000,
++		0x00000000, 0x204cc004, 0x3f800000, 0x204cc005, 0x00000001, 0x20144001, 0x00000000, 0x20144000,
++		0x00000000, 0x00000100, 0x17e01000, 0x63808002, 0x17e11001, 0x63800003, 0x00000000, 0x03000000,
++	544, 97, 0x70dc8014, 0x0000a800, 0x00104100, 0x0000a824, 0x00000002, 0x0000a81b, 0x00000000, 0x0000a81c,
++		0x30005680, 0x0000a81d, 0x00000000, 0x0000a81e, 0x00000000, 0x0000a81f, 0x00000000, 0x0000a820,
++		0x00000000, 0x0000a821, 0x00000000, 0x0000a825, 0x00000000, 0x706d8003, 0x00000004, 0x00009b07,
++		0x00000006, 0x40a00801, 0x00000006, 0x48a00001, 0x00000000, 0x40a00101, 0xfcfcfc00, 0x70328003,
++		0x00a20000, 0x30005680, 0x00000000, 0x70dc8014, 0x0000a800, 0x00104100, 0x0000a824, 0x00000002,
++		0x0000a81b, 0x00000000, 0x0000a81c, 0x30005780, 0x0000a81d, 0x00000000, 0x0000a81e, 0x00000000,
++		0x0000a81f, 0x00000000, 0x0000a820, 0x00000000, 0x0000a821, 0x00000000, 0x0000a825, 0x00000000,
++		0x706d8003, 0x00000004, 0x00009b07, 0x00000006, 0x40a00801, 0x00000006, 0x48a00001, 0x00000000,
++		0x40a00101, 0xfcfcfc00, 0x70328003, 0x00a20000, 0x30005780, 0x00000000, 0x70dc0004, 0x00009216,
++		0x00000000, 0x00009305, 0x00000000, 0x70dc0016, 0x0000a803, 0x00000f02, 0x0000a813, 0x00000000,
++		0x00009301, 0x00ff0004, 0x00009101, 0x00ffff00, 0x00009311, 0x00ffff00, 0x00008001, 0x00000000,
++		0x00009b01, 0x00000004, 0x0000a802, 0x00000001, 0x00009104, 0x00ffffff, 0x00009314, 0x00ffffff,
++		0x0000809b,
++	928, 10, 0x00002000, 0x47308902, 0x00000000, 0x00010500, 0xc0200005, 0xa0c81f04, 0x17e40004, 0x50780b08,
++		0x00000000, 0x03000000,
++	960, 64, 0x70dc8014, 0x0000a980, 0x85400180, 0x0000ab05, 0x00000001, 0x0000a982, 0x00000000, 0x0000a983,
++		0x30005e80, 0x0000a984, 0x00000000, 0x0000a985, 0x00000000, 0x0000a986, 0x00000000, 0x0000a987,
++		0x00000000, 0x0000a988, 0x00000000, 0x0000a9a9, 0x00000000, 0x48a00601, 0x00000000, 0x40980601,
++		0x00000000, 0x40a99e01, 0x00000000, 0x40b98285, 0x00000007, 0xfcfcfcfc, 0xfcfcfc00, 0xfcfcfcfc,
++		0x0000fcfc, 0x48b98001, 0x00000002, 0x40800501, 0x00000001, 0x48880902, 0x00000401, 0x00000000,
++		0x40881001, 0x00000000, 0x40810101, 0x00000000, 0x48810901, 0x00000000, 0x40921204, 0xfffffffc,
++		0xffffffff, 0xffffffff, 0xffffffff, 0x40930401, 0xff01ff02, 0x40a98c01, 0xfcfcfc00, 0x48a98e01,
++		0x00000008, 0x48a98b01, 0x0000000f, 0x40880b01, 0x00000000, 0x40880d01, 0x0000000f, 0x70348003,
++	0xffffffff,
++	/* 30006000 */
++	0, 2, 0x00720000, 0x30005e80,
++	64, 61, 0x70dc001a, 0x0000bb11, 0x00000001, 0x0000ab00, 0x0000000d, 0x0000bb08, 0x0000019f, 0x0000b800,
++		0x00000102, 0x0000b801, 0x00000000, 0x0000b802, 0x00000000, 0x0000b803, 0x00000000, 0x0000bb10,
++		0x00000100, 0x0000a823, 0x00000100, 0x0000a83b, 0x00000000, 0x0000a863, 0x00000000, 0x0000a894,
++		0x00000000, 0x0000ab04, 0x00000103, 0x70dc0004, 0x00009216, 0x00000000, 0x00009305, 0x00000000,
++		0x40920001, 0x00000000, 0x48920801, 0x00000000, 0x70dc0016, 0x0000a803, 0x0f040302, 0x0000a813,
++		0x00000200, 0x00009301, 0x00ff0206, 0x00009101, 0x00ffff00, 0x00009311, 0x00ffff00, 0x00008001,
++		0x00000000, 0x00009b01, 0x00000006, 0x0000a802, 0x00000002, 0x00009104, 0x00ffffff, 0x00009314,
++		0x00ffffff, 0x0000809b, 0x00000000, 0x70348003, 0x00514000,
++	127, 43, 0x70348003, 0x00510000, 0x00000010, 0x00000000, 0x4080a001, 0x00000002, 0x70dc001a, 0x00008010,
++		0x43000000, 0x00008011, 0x43000000, 0x00008012, 0x43000000, 0x00008013, 0x43000000, 0x00008014,
++		0x00000000, 0x00008015, 0x3f800000, 0x000080d0, 0x00000000, 0x000080d1, 0x00ff00ff, 0x00008070,
++		0x00000000, 0x00008071, 0x3f800000, 0x000088c0, 0x00000000, 0x000088c1, 0x3f800000, 0x00008006,
++		0x0007fdff, 0x4880b002, 0x00000000, 0x00ff00ff, 0x4880a401, 0x00000000, 0x40880401, 0x00000000,
++		0x48b30401, 0x00000000, 0x40809583,
++	173, 12, 0x40a98901, 0x00000101, 0x48886501, 0xffff0101, 0x40882002, 0x00000783, 0x07010701, 0x48a98d01,
++		0x00000001, 0x48880c01, 0x00000001, 0x48886004,
++	189, 30, 0x40809001, 0x00002010, 0x40800001, 0x000000c0, 0x48910801, 0x00000003, 0x48998101, 0x00000003,
++		0x40998001, 0x00000000, 0x48910701, 0x00000000, 0x48809102, 0xffc00001, 0x00000010, 0x40888001,
++		0x00000000, 0x40811501, 0x00000000, 0x48888801, 0x00000000, 0x40888901, 0x00000000, 0x48888701,
++		0x00000000, 0x48887101, 0x00000000, 0x48811401, 0x00000000, 0x48887802,
++	221, 2, 0x4080a001, 0x00000002,
++	0xffffffff,
++	/* 30025000 */
++	0, 111, 0x48980401, 0x0000000f, 0x40980501, 0x00000000, 0x40a0f801, 0x00000000, 0x40b60001, 0x00000000,
++		0x40860001, 0x00000000, 0x40ae0301, 0x00000000, 0x40ae0001, 0x00000000, 0x480e1901, 0x00000004,
++		0x40be0401, 0x00000000, 0x48960001, 0x00000000, 0x400e1201, 0x10000000, 0x48ae0401, 0x00000000,
++		0x40ae0f01, 0x0000003f, 0x40b60501, 0x00000044, 0x48be0001, 0x00000080, 0x40be0101, 0x00000000,
++		0x48ab2001, 0x00000000, 0x48b18201, 0x00000000, 0x48bb1101, 0x00000000, 0x40a9a801, 0x00000000,
++		0x40ab0001, 0x00000005, 0x48a00901, 0x00000003, 0x48881101, 0x00000010, 0x40811001, 0x00000000,
++		0x48881801, 0x00000000, 0x40881901, 0x00000000, 0x40881a01, 0x00000000, 0x48881b01, 0x00000000,
++		0x40881c01, 0x00000000, 0x48881d01, 0x00000000, 0x48881e01, 0x00000000, 0x4888f001, 0x00000000,
++		0x40923601, 0x00000000, 0x48930001, 0x00000000, 0x48930601, 0x00000001, 0x40b18301, 0x00000000,
++		0x4080af01, 0x00000000, 0x40809901, 0x00000000, 0x40980a01, 0x00000000, 0x48921001, 0x00000000,
++		0x40921101, 0x00000000, 0x40960201, 0x00000000, 0x409e7201, 0x00000000, 0x40b30901, 0x000000a2,
++		0x48b98601, 0x000000fc, 0x40a00701, 0x00000000, 0x40886401, 0x00000000, 0x48b30202, 0x30004200,
++		0x00000000, 0x40b18002, 0x30004200, 0x00000000, 0x408e0401, 0x04100000, 0x408e0101, 0x00000001,
++		0x48b80001, 0x00000102, 0x408e0701, 0x0fa00001, 0x70c28003, 0x01000c38, 0x300040d0,
++	0xffffffff,
++	/* 300e6000 */
++	0, 6, 0x0c006880, 0x00800100, 0x20020002, 0x00000040, 0x30066000, 0x00020000,
++	16, 3, 0x0000092a, 0x00000000, 0x00000010,
++	0xffffffff,
++	/* 300e7000 */
++	0, 115, 0x70460001, 0x00000031, 0x40bb0801, 0x000fffff, 0x70268000, 0x48980401, 0x0000000f, 0x40980501,
++		0x00000000, 0x40a0f801, 0x00000000, 0x40b60001, 0x00000000, 0x40860001, 0x00000000, 0x40ae0301,
++		0x00000000, 0x40ae0001, 0x00000000, 0x480e1901, 0x00000004, 0x40be0401, 0x00000000, 0x48960001,
++		0x00000000, 0x400e1201, 0x10000000, 0x48ae0401, 0x00000000, 0x40ae0f01, 0x0000003f, 0x40b60501,
++		0x00000044, 0x48be0001, 0x00000080, 0x40be0101, 0x00000000, 0x48ab2001, 0x00000000, 0x48b18201,
++		0x00000000, 0x48bb1101, 0x00000000, 0x40a9a801, 0x00000000, 0x40ab0001, 0x00000005, 0x48a00901,
++		0x00000003, 0x48881101, 0x00000010, 0x40811001, 0x00000000, 0x48881801, 0x00000000, 0x40881901,
++		0x00000000, 0x40881a01, 0x00000000, 0x48881b01, 0x00000000, 0x40881c01, 0x00000000, 0x48881d01,
++		0x00000000, 0x48881e01, 0x00000000, 0x4888f001, 0x00000000, 0x40923601, 0x00000000, 0x48930001,
++		0x00000000, 0x48930601, 0x00000001, 0x40b18301, 0x00000000, 0x4080af01, 0x00000000, 0x40809901,
++		0x00000000, 0x40980a01, 0x00000000, 0x48921001, 0x00000000, 0x40921101, 0x00000000, 0x40960201,
++		0x00000000, 0x409e7201, 0x00000000, 0x40b30901, 0x000000a2, 0x48b98601, 0x000000fc, 0x40a00701,
++		0x00000000, 0x40886401, 0x00000000, 0x48b30202, 0x30004200, 0x00000000, 0x40b18002, 0x30004200,
++		0x00000000, 0x408e0401, 0x04100000, 0x408e0101, 0x00000001, 0x48b80001, 0x00000102, 0x408e0701,
++		0x01000001, 0x70438003, 0x00040000,
++	117, 5, 0x70d58003, 0x30025000, 0x00000000, 0x00100070, 0x70d58003,
++	125, 1, 0x70d58003,
++	128, 42, 0x00200000, 0x48810001, 0x00000000, 0x70dc800a, 0x00008103, 0x00000000, 0x00008104, 0x00000000,
++		0x00008105, 0x00000000, 0x00008106, 0x00000000, 0x00008107, 0x00000000, 0x4080f002, 0x00000000,
++		0x00ff00ff, 0x48840a02, 0x00000000, 0x00ff00ff, 0x70dc0008, 0x00008890, 0x00000000, 0x000088d4,
++		0x00000000, 0x0000b4d1, 0x00000000, 0x0000b307, 0x00000000, 0x4880a101, 0x00e00000, 0x48880001,
++		0x00e00000, 0x4088d301, 0x00000000, 0x70e50001, 0x00000001, 0x709d0001, 0x00000000, 0x70460004,
++		0x0000001d, 0x30004000,
++	172, 3, 0x70460004, 0x0000001c, 0x30004000,
++	177, 7, 0x70460001, 0x00000019, 0x70460001, 0x00000018, 0x70460004, 0x00000004, 0x30004000,
++	186, 17, 0x70460001, 0x00000031, 0x40bb0801, 0x0007fe00, 0x70928000, 0x70268000, 0x70640001, 0x00000001,
++		0x70e30001, 0x00000000, 0x70bf8003, 0x300eb000, 0x00000000, 0x0000014c, 0x70460004, 0x0000001d,
++		0x30004000,
++	205, 9, 0x70460001, 0x00000031, 0x70268000, 0x709d0001, 0x00000000, 0x70460001, 0x00000026, 0x70438003,
++		0x00040000,
++	216, 3, 0x70460004, 0x0000001d, 0x30004000,
++	221, 3, 0x70460004, 0x0000001c, 0x30004000,
++	226, 7, 0x70460001, 0x00000019, 0x70460001, 0x00000018, 0x70460004, 0x00000004, 0x30004000,
++	235, 30, 0x70460001, 0x00000031, 0x40bb0801, 0x0007fe00, 0x70928000, 0x70268000, 0x488c0101, 0x00000000,
++		0x408c0001, 0x00f03000, 0x48840001, 0x00f03000, 0x48acc001, 0x0000f180, 0x48840502, 0x00000000,
++		0x00ff00ff, 0x40840104, 0x00000000, 0x0000ff00, 0x00000000, 0x0000ff00, 0x48b4c085, 0x00500430,
++		0x00800100, 0x30026000, 0x00000000, 0x00002000, 0x48b4ca83, 0x30026000,
++	267, 7, 0x408c1704, 0x00000430, 0x300a6000, 0x00000000, 0x00000010, 0x488c2083, 0x300a6000,
++	276, 5, 0x702c0001, 0x00000003, 0x70460004, 0x0000001d, 0x30004000,
++	283, 3, 0x70460004, 0x0000001c, 0x30004000,
++	0xffffffff,
++	/* 300eb000 */
++	0, 18, 0x70c70002, 0x34000000, 0x00000014, 0x4888d102, 0x00000000, 0x00ff00ff, 0x4088d501, 0x00000000,
++		0x4888d701, 0x00001800, 0x4088e301, 0x000000f2, 0x4088d601, 0x00000000, 0x4088d001, 0x00000000,
++		0x4088df04, 0xff800000,
++	21, 22, 0x70460001, 0x0000001e, 0x70c70002, 0x38000000, 0x00000028, 0x488c0101, 0x00000000, 0x408c0001,
++		0x00f03080, 0x48840001, 0x00f03080, 0x48acc001, 0x0000f180, 0x48840502, 0x00000000, 0x00ff00ff,
++		0x40840104, 0x00000000, 0x0000ff00, 0x00000000, 0x0000ff00, 0x488c2c04,
++	45, 9, 0x00000080, 0x000000ff, 0x408c1704, 0x00000430, 0x30026000, 0x00000000, 0x00000010, 0x488c2083,
++		0x30026000,
++	56, 5, 0x702c0001, 0x00000003, 0x70460004, 0x0000001d, 0x30004000,
++	63, 4, 0x70460001, 0x00000019, 0x70268000, 0x48887286,
++	73, 184, 0x48809801, 0x00000000, 0x48888101, 0x00000000, 0x70dc0080, 0x00008822, 0x00002030, 0x00008823,
++		0x00000010, 0x00008824, 0x00001000, 0x00008825, 0x30026000, 0x00008826, 0x00000000, 0x00008827,
++		0x00000000, 0x0000a996, 0x00000030, 0x00008903, 0x30026000, 0x00008904, 0x00000000, 0x00008905,
++		0x00000000, 0x0000882a, 0x00000000, 0x0000882b, 0x00000000, 0x0000882c, 0x00000000, 0x0000882d,
++		0x00000000, 0x0000882e, 0x00000000, 0x0000882f, 0x00000000, 0x0000a997, 0x00000000, 0x00008832,
++		0x00000000, 0x00008833, 0x00000000, 0x00008834, 0x00000000, 0x00008835, 0x00000000, 0x00008836,
++		0x00000000, 0x00008837, 0x00000000, 0x0000a998, 0x00000000, 0x0000883a, 0x00000000, 0x0000883b,
++		0x00000000, 0x0000883c, 0x00000000, 0x0000883d, 0x00000000, 0x0000883e, 0x00000000, 0x0000883f,
++		0x00000000, 0x0000a999, 0x00000000, 0x00008842, 0x00000000, 0x00008843, 0x00000000, 0x00008844,
++		0x00000000, 0x00008845, 0x00000000, 0x00008846, 0x00000000, 0x00008847, 0x00000000, 0x0000a99a,
++		0x00000000, 0x0000884a, 0x00000000, 0x0000884b, 0x00000000, 0x0000884c, 0x00000000, 0x0000884d,
++		0x00000000, 0x0000884e, 0x00000000, 0x0000884f, 0x00000000, 0x0000a99b, 0x00000000, 0x00008852,
++		0x00000000, 0x00008853, 0x00000000, 0x00008854, 0x00000000, 0x00008855, 0x00000000, 0x00008856,
++		0x00000000, 0x00008857, 0x00000000, 0x0000a99c, 0x00000000, 0x0000885a, 0x00000000, 0x0000885b,
++		0x00000000, 0x0000885c, 0x00000000, 0x0000885d, 0x00000000, 0x0000885e, 0x00000000, 0x0000885f,
++		0x00000000, 0x0000a99d, 0x00000000, 0x00008102, 0x00000030, 0x0000880e, 0x00000000, 0x0000880f,
++		0x00000000, 0x0000a98a, 0x00000000, 0x00008004, 0x00000000, 0x70c70002, 0x3c000000, 0x00000004,
++		0x706d8003, 0x00000002, 0x00008801, 0x00000010, 0x70438006, 0x0f200009, 0x300ef100, 0x00000000,
++		0x10400009, 0x300ef240, 0x00000000, 0x409b0001, 0x00000000, 0x48980201, 0x00000000, 0x70dc800c,
++		0x0000b300, 0x00000000, 0x0000b301, 0x00000004, 0x000080a2, 0x00000000, 0x000080a3, 0x00000004,
++		0x00008802, 0x00000000, 0x00008803, 0x00000004, 0x7043805a, 0x0070001b, 0x30006100, 0x00000000,
++		0x01610023, 0x30005880, 0x00000000, 0x0211003f, 0x3000590c, 0x00000000, 0x03710002, 0x30005000,
++		0x00000000, 0x04710003, 0x30005080, 0x00000000, 0x05710002, 0x30005100, 0x00000000, 0x06130000,
++	259, 19, 0x08610043, 0x30005f00, 0x00000000, 0x07600020, 0x3000616c, 0x00000000, 0x12200002, 0x3000620c,
++		0x00000000, 0x0a70000c, 0x300ef290, 0x00000000, 0x0b700008, 0x300ef2c0, 0x00000000, 0x0c610008,
++		0x300061ec, 0x00000000, 0x09720000,
++	280, 4, 0x0d700003, 0x300ef264, 0x00000000, 0x0e720000,
++	286, 46, 0x11700008, 0x300ef270, 0x00000000, 0x1370001b, 0x30006214, 0x00000000, 0x14700003, 0x30006280,
++		0x00000000, 0x1570000f, 0x300062f4, 0x00000000, 0x16700004, 0x300062a4, 0x00000000, 0x17700005,
++		0x300062e0, 0x00000000, 0x1870000a, 0x30006330, 0x00000000, 0x19700007, 0x30006358, 0x00000000,
++		0x1a700006, 0x3000628c, 0x00000000, 0x1b720000, 0x30006214, 0x00000000, 0x1c70000b, 0x300062b4,
++		0x00000000, 0x1d720000, 0x30006214, 0x00000000, 0x1e720000, 0x300ef270, 0x00000000, 0x1f500002,
++		0x30006374, 0x00000000, 0x70388003, 0x00000d86, 0x00000001, 0x00000004,
++	0xffffffff,
++	/* 300ef000 */
++	32, 6, 0x0c006882, 0x00800100, 0x20010000, 0x00000000, 0x00100000, 0x00020000,
++	48, 6, 0x0c006882, 0x00800100, 0x20010000, 0x00000000, 0x00100000, 0x00020000,
++	64, 9, 0x70348003, 0x01124000, 0x300ef000, 0x00000000, 0x48a9e402, 0x300ef000, 0x00000000, 0x40a9a701,
++		0x00000004,
++	112, 6, 0x4c006880, 0x00800100, 0x20020002, 0x00000040, 0x30026000, 0x00020000,
++	128, 6, 0x4c006880, 0x00800100, 0x20020002, 0x00000040, 0x30026000, 0x00020000,
++	144, 10, 0x70348003, 0x01124000, 0x300ef140, 0x00000000, 0x48a9e402, 0x300ef140, 0x00000000, 0x40a9a701,
++		0x00000004, 0x40a00e02,
++	156, 10, 0x48810001, 0x00000000, 0x40889801, 0x00000000, 0x48809401, 0x00000000, 0x40887001, 0x00000000,
++		0x70b6000b, 0x02384000,
++	168, 16, 0xbf000000, 0xbf000000, 0x3f000000, 0x3f000000, 0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
++		0x48ab1002, 0x300e6003, 0x00000000, 0x40bb2002, 0x300e6003, 0x00000000, 0x40bb0801, 0x0007c000,
++	0xffffffff,
++};
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6f29fba..835d1f1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -40,6 +40,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
+ extern "C" void topaz_modem_init(void);
++extern "C" void sapphire_gpu_init(void);            /* iokit/Kernel/arm/SapphireGpu.cpp (boot-arg gpu=N) */
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ 
+@@ -269,6 +270,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	topaz_modem_init();
+ 	sweet_busy_init();
++	sapphire_gpu_init();
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index cc24c81..c7e119a 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -12,6 +12,7 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
++iokit/Kernel/arm/SapphireGpu.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp

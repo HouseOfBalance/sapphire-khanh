@@ -1,0 +1,334 @@
+/*
+ * The libdrm of xf86drm.h (see there): Linux's DRM requests to the kernel's GPU driver as calls
+ * of its IOKit user client. A request's number (the low byte of the ioctl code) is the call's
+ * selector, its structure goes in and comes back as it is; a buffer's memory is the client
+ * memory of the type that is the buffer's handle.
+ *
+ * freedreno knows its device by a file descriptor. It gets one that means nothing (/dev/null):
+ * there is one GPU and one connection to it in a process.
+ */
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <IOKit/IOKitLib.h>
+#include <mach/mach_time.h>
+
+#include "xf86drm.h"
+
+#define REDWOOD_GPU_SERVICE     "SapphireGPU"     /* sapphire: xnu patch 0149 */
+#define REDWOOD_GPU_SURFACE     0x7e            /* the request that is not Linux's */
+#define REDWOOD_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
+
+static io_connect_t connection;
+static int connection_fd = -1;
+
+int
+drmOpenWithType(const char *name, const char *busid, int type)
+{
+	io_service_t service;
+
+	(void)busid;
+	(void)type;
+	if (strcmp(name, "msm") != 0) {
+		return -1;
+	}
+	if (connection_fd >= 0) {
+		return dup(connection_fd);
+	}
+	service = IOServiceGetMatchingService(0, IOServiceMatching(REDWOOD_GPU_SERVICE));
+	if (service == 0) {
+		return -1;
+	}
+	if (IOServiceOpen(service, mach_task_self(), 0, &connection) != 0) {
+		IOObjectRelease(service);
+		return -1;
+	}
+	IOObjectRelease(service);
+	connection_fd = open("/dev/null", O_RDWR);
+	return dup(connection_fd);
+}
+
+/*
+ * sapphire (xnu 0151): the kernel's buffers come from GPU memory that is not the kernel's and
+ * are to be mapped write-combined (GET_PARAM 0x1000 says so); an IOSurface's memory is the
+ * kernel's and must stay cached (a write-combined mapping of it panics that kernel). So the
+ * handles that are surfaces are remembered here.
+ */
+#define SAPPHIRE_HANDLES        8192
+static uint8_t surface_handle[SAPPHIRE_HANDLES / 8];
+static int wc_buffers = -1;
+
+static void
+mark_surface(uint32_t handle, int on)
+{
+	if (handle < SAPPHIRE_HANDLES) {
+		if (on) {
+			surface_handle[handle >> 3] |= (uint8_t)(1u << (handle & 7));
+		} else {
+			surface_handle[handle >> 3] &= (uint8_t)~(1u << (handle & 7));
+		}
+	}
+}
+
+static int
+is_surface(uint32_t handle)
+{
+	return handle < SAPPHIRE_HANDLES && (surface_handle[handle >> 3] >> (handle & 7)) & 1;
+}
+
+static int call(unsigned number, void *data, size_t size);
+
+static int
+buffers_write_combined(void)
+{
+	if (wc_buffers < 0) {
+		struct { uint32_t pipe, param; uint64_t value; uint32_t len, pad; } p = { 0x10, 0x1000, 0, 0, 0 };
+		wc_buffers = call(0x40, &p, sizeof(p)) == 0 && p.value != 0;
+	}
+	return wc_buffers;
+}
+
+/* sapphire: what each request costs, a line every 5 s (file /redwood/drmstats: on) */
+static int stats_on = -1;
+static uint64_t stats_us[256], stats_n[256], stats_max[256], stats_t0;
+
+static uint64_t
+now_us(void)
+{
+	static mach_timebase_info_data_t tb;
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return mach_absolute_time() * tb.numer / tb.denom / 1000;
+}
+
+static void
+stats_add(unsigned number, uint64_t us)
+{
+	char line[512];
+	int n = 0;
+	uint64_t t = now_us();
+
+	stats_us[number & 0xff] += us;
+	stats_n[number & 0xff]++;
+	if (us > stats_max[number & 0xff]) {
+		stats_max[number & 0xff] = us;
+	}
+	if (stats_t0 == 0) {
+		stats_t0 = t;
+	}
+	if (t - stats_t0 < 5000000) {
+		return;
+	}
+	n = snprintf(line, sizeof(line), "redwood-drm: 5 s:");
+	for (unsigned i = 0; i < 256 && n < (int)sizeof(line) - 48; i++) {
+		if (stats_n[i] != 0 && stats_us[i] >= 1000) {
+			n += snprintf(line + n, sizeof(line) - n, " %02x %llux %lluus max %llu;", i, stats_n[i],
+			    stats_us[i] / stats_n[i], stats_max[i]);
+		}
+		stats_us[i] = stats_n[i] = stats_max[i] = 0;
+	}
+	line[n++] = '\n';
+	write(2, line, (size_t)n);
+	stats_t0 = t;
+}
+
+static int
+call(unsigned number, void *data, size_t size)
+{
+	size_t returned = size;
+	if (stats_on < 0) {
+		stats_on = access("/redwood/drmstats", F_OK) == 0;
+	}
+	/*
+	 * MSM_GEM_MADVISE: the kernel keeps every buffer and answers "retained" (xnu 0149), and
+	 * freedreno's buffer cache asks it at every reuse and every return: 1100 calls a second of
+	 * animation measured, 56 us each through IOKit -- 6% of the drawing thread for nothing. Answered here.
+	 */
+	if (number == 0x48 && size >= 12) {
+		((uint32_t *)data)[2] = 1;
+		return 0;
+	}
+	uint64_t t0 = stats_on ? now_us() : 0;
+	kern_return_t result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
+	if (stats_on) {
+		stats_add(number, now_us() - t0);
+	}
+
+	switch (result) {
+	case 0:
+		return 0;
+	case kIOReturnNoMemory:
+		return ENOMEM;
+	case kIOReturnBadArgument:
+		return EINVAL;
+	case kIOReturnTimeout:
+		return ETIMEDOUT;
+	case kIOReturnBusy:
+		return EBUSY;
+	case kIOReturnNotFound:
+		return ENOENT;
+	case kIOReturnUnsupported:
+		return ENOSYS;
+	default:
+		return EIO;
+	}
+}
+
+int
+drmIoctl(int fd, unsigned long request, void *arg)
+{
+	int error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
+
+	(void)fd;
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+	if ((request & 0xff) == 0x09) {         /* GEM_CLOSE: the handle may come back as an ordinary buffer */
+		mark_surface(*(const uint32_t *)arg, 0);
+	}
+	return 0;
+}
+
+int
+drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long size)
+{
+	(void)fd;
+	return -call((unsigned)(DRM_COMMAND_BASE + index), (void *)(uintptr_t)data, size);
+}
+
+int
+drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
+{
+	(void)fd;
+	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
+}
+
+/*
+ * The driver calls itself what Linux's is called, and is of the version whose interface it has:
+ * 1.7, buffers at addresses the kernel chooses and tells ("softpin"), nothing newer.
+ */
+drmVersionPtr
+drmGetVersion(int fd)
+{
+	drmVersionPtr version = calloc(1, sizeof(*version));
+
+	(void)fd;
+	if (version != NULL) {
+		version->version_major = 1;
+		version->version_minor = 7;
+		version->name = strdup("msm");
+		version->name_len = 3;
+		version->date = strdup("");
+		version->desc = strdup("Adreno on Darwin");
+		version->desc_len = (int)strlen(version->desc);
+	}
+	return version;
+}
+
+void
+drmFreeVersion(drmVersionPtr version)
+{
+	if (version != NULL) {
+		free(version->name);
+		free(version->date);
+		free(version->desc);
+		free(version);
+	}
+}
+
+int
+drmGetCap(int fd, uint64_t capability, uint64_t *value)
+{
+	(void)fd;
+	(void)capability;
+	*value = 0;
+	return 0;
+}
+
+void *
+redwood_drm_map(int fd, uint32_t handle, uint64_t size)
+{
+	mach_vm_address_t address = 0;
+	mach_vm_size_t mapped = 0;
+
+	(void)fd;
+	(void)size;
+	/*
+	 * Linux gives freedreno its buffers write-combined, with no cache of this processor's between
+	 * the program and the memory the GPU sees. So does the kernel's driver here: the memory is
+	 * made that way, and this mapping is as the memory is.
+	 */
+	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped,
+	    kIOMapAnywhere | (buffers_write_combined() && !is_surface(handle) ? kIOMapWriteCombineCache : 0)) != 0) {
+		return (void *)-1;              /* mmap()'s MAP_FAILED */
+	}
+	return (void *)(uintptr_t)address;
+}
+
+void
+redwood_drm_unmap(int fd, uint32_t handle, void *address)
+{
+	(void)fd;
+	IOConnectUnmapMemory64(connection, handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)address);
+}
+
+int
+redwood_drm_surface(int fd, struct redwood_drm_surface *surface)
+{
+	int error;
+
+	(void)fd;
+	surface->handle = REDWOOD_GPU_DESCRIBE;
+	error = call(REDWOOD_GPU_SURFACE, surface, sizeof(*surface));
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+	return 0;
+}
+
+int
+drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
+{
+	struct redwood_drm_surface request = { .surface = (uint32_t)surface };
+	int error = call(REDWOOD_GPU_SURFACE, &request, sizeof(request));
+
+	(void)fd;
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+	*handle = request.handle;
+	mark_surface(request.handle, 1);
+	return 0;
+}
+
+static int
+none(void)
+{
+	errno = ENOSYS;
+	return -1;
+}
+
+/* Buffers and fences as file descriptors, for handing them to other programs and drivers: none of that here. */
+#define NONE(name, ...) int name(__VA_ARGS__) { return none(); }
+NONE(drmPrimeHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
+    __attribute__((unused)) uint32_t flags, __attribute__((unused)) int *prime_fd)
+NONE(drmSyncobjCreate, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t flags,
+    __attribute__((unused)) uint32_t *handle)
+NONE(drmSyncobjDestroy, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle)
+NONE(drmSyncobjReset, __attribute__((unused)) int fd, __attribute__((unused)) const uint32_t *handles,
+    __attribute__((unused)) uint32_t count)
+NONE(drmSyncobjFDToHandle, __attribute__((unused)) int fd, __attribute__((unused)) int obj_fd,
+    __attribute__((unused)) uint32_t *handle)
+NONE(drmSyncobjHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
+    __attribute__((unused)) int *obj_fd)
+NONE(drmSyncobjImportSyncFile, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
+    __attribute__((unused)) int sync_file_fd)
+NONE(drmSyncobjExportSyncFile, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
+    __attribute__((unused)) int *sync_file_fd)

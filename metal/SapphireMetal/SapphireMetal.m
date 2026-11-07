@@ -1,0 +1,595 @@
+/*
+ * SapphireMetal: a Metal driver for the Adreno 610, step 0 — a device that tells us what iOS asks
+ * of one.
+ *
+ * Metal finds its driver through the accelerator service in the IORegistry
+ * (getMetalPluginClassForService): MetalPluginName names a bundle in /System/Library/Extensions,
+ * MetalPluginClassName a class in it, which must be a subclass of _MTLDevice, and the device is
+ * [[class alloc] initWithAcceleratorPort:port]. _MTLDevice's own initWithAcceleratorPort: is
+ * abstract; Apple's IOGPUMetalDevice does [super init] and then opens its kernel interface. This
+ * one does [super init] only.
+ *
+ * Every instance method of the MTLDeviceSPI protocol (which takes in MTLDevice) is routed through
+ * forwardInvocation:, which writes the selector to stderr (the kernel console shows it, prefixed
+ * with the process name), then hands the call to _MTLDevice when it has an implementation, and
+ * otherwise answers zero. Abstract methods end in doesNotRecognizeSelector:, which logs and
+ * answers zero instead of raising. The result is the list, in order, of what CoreAnimation and
+ * the rest of iOS want from a Metal device, which is what the real driver has to implement.
+ *
+ * Built on Linux: clang -target arm64-apple-ios16.0, ld64.lld against the stubs in ../tbd, ad-hoc
+ * signed (see build.sh). No Apple headers: what is needed is declared here.
+ */
+/* Darwin's libc, declared here (Linux's headers do not describe it) */
+typedef unsigned long size_t;
+int sgpu_selftest(unsigned int service);   /* sgpu_selftest.c */
+void *dlopen(const char *, int);
+char *dlerror(void);
+const char *getprogname(void);
+int sysctlbyname(const char *, void *, size_t *, void *, size_t);
+char *strstr(const char *, const char *);
+unsigned int IOServiceGetMatchingService(unsigned int, void *);
+void *IOServiceMatching(const char *);
+int IOObjectRelease(unsigned int);
+int usleep(unsigned int);
+typedef struct __sFILE FILE;
+extern FILE *__stderrp;
+#define stderr __stderrp
+#define NULL ((void *)0)
+int fprintf(FILE *, const char *, ...) __attribute__((format(printf, 2, 3)));
+int fputc(int, FILE *);
+int getpid(void);
+void *calloc(size_t, size_t);
+void free(void *);
+int strcmp(const char *, const char *);
+int strncmp(const char *, const char *, size_t);
+char *strstr(const char *, const char *);
+
+typedef struct objc_method *Method;
+typedef struct objc_protocol_def Protocol_t;
+struct objc_method_description {
+	SEL name;
+	const char *types;
+};
+typedef void (*IMP_t)(void);
+
+extern id objc_msgSend(id, SEL, ...);
+struct objc_super {
+	id receiver;
+	Class super_class;
+};
+extern id objc_msgSendSuper(struct objc_super *, SEL, ...);
+extern Class objc_getClass(const char *);
+extern void *objc_getProtocol(const char *);
+extern struct objc_method_description *protocol_copyMethodDescriptionList(void *p, int required, int instance,
+    unsigned int *count);
+extern void **protocol_copyProtocolList(void *p, unsigned int *count);
+extern const char *protocol_getName(void *p);
+extern int class_addMethod(Class cls, SEL name, IMP_t imp, const char *types);
+extern int class_addProtocol(Class cls, void *protocol);
+extern Class objc_allocateClassPair(Class superclass, const char *name, size_t extra);
+extern void objc_registerClassPair(Class cls);
+extern const char *class_getName(Class cls);
+extern Class object_getClass(id obj);
+int snprintf(char *, size_t, const char *, ...);
+extern Method class_getInstanceMethod(Class cls, SEL name);
+extern IMP_t method_getImplementation(Method m);
+extern Class class_getSuperclass(Class cls);
+extern const char *sel_getName(SEL sel);
+extern SEL sel_registerName(const char *str);
+extern void _objc_msgForward(void);
+
+__attribute__((objc_root_class))
+@interface NSObject
+@end
+
+@interface _MTLDevice : NSObject
+- (id)init;
+@end
+
+@interface SapphireMTLDevice : _MTLDevice
+@end
+
+static unsigned int sapphire_port;
+static id sapphire_device;
+static int sapphire_logged;
+
+/* one fprintf per line: the console splits a line written in several pieces */
+#define SLOG(fmt, ...) fprintf(stderr, "SAPPHIRE MTL[%d]: " fmt "\n", getpid(), ##__VA_ARGS__)
+
+static id
+msg0(id obj, const char *sel)
+{
+	return ((id (*)(id, SEL))objc_msgSend)(obj, sel_registerName(sel));
+}
+
+static void
+route_protocol(Class cls, void *proto, int depth)
+{
+	unsigned int n = 0;
+
+	for (int required = 1; required >= 0; required--) {
+		struct objc_method_description *m = protocol_copyMethodDescriptionList(proto, required, 1, &n);
+		for (unsigned int i = 0; i < n; i++) {
+			const char *name = sel_getName(m[i].name);
+			if (strcmp(name, "initWithAcceleratorPort:") == 0 || strncmp(name, "init", 4) == 0 ||
+			    strcmp(name, "dealloc") == 0 || strcmp(name, "retain") == 0 || strcmp(name, "release") == 0 ||
+			    strcmp(name, "autorelease") == 0 || strcmp(name, "retainCount") == 0 ||
+			    strcmp(name, "respondsToSelector:") == 0 || strcmp(name, "conformsToProtocol:") == 0 ||
+			    strcmp(name, "isKindOfClass:") == 0 || strcmp(name, "class") == 0 || strcmp(name, "hash") == 0 ||
+			    strcmp(name, "isEqual:") == 0 || strcmp(name, "description") == 0 ||
+			    strcmp(name, "debugDescription") == 0 || strcmp(name, "zone") == 0) {
+				continue;
+			}
+			(void)class_addMethod(cls, m[i].name, (IMP_t)_objc_msgForward, m[i].types);
+		}
+		free(m);
+	}
+	if (depth < 4) {
+		unsigned int np = 0;
+		void **sub = protocol_copyProtocolList(proto, &np);
+		for (unsigned int i = 0; i < np; i++) {
+			if (strcmp(protocol_getName(sub[i]), "NSObject") != 0) {
+				route_protocol(cls, sub[i], depth + 1);
+			}
+		}
+		free(sub);
+	}
+}
+
+/*
+ * Step 0b: objects of the right kind. When a routed method returns an object, the selector tells
+ * what CoreAnimation expects back (newCommandQueue -> an MTLCommandQueue, commandBuffer -> an
+ * MTLCommandBuffer, newTexture... -> an MTLTexture, ...), and it gets a stub of that kind: a
+ * class made at run time per protocol, declaring the protocol (and its SPI twin) and routing all
+ * of its methods through the same logging forwardInvocation. Nothing is drawn; the point is to
+ * see the whole of what is asked, not only up to the first nil.
+ */
+static const struct {
+	const char *needle, *proto;
+} stub_kinds[] = {
+	{ "parallelRenderCommandEncoder", "MTLParallelRenderCommandEncoder" },
+	{ "renderCommandEncoder", "MTLRenderCommandEncoder" },
+	{ "blitCommandEncoder", "MTLBlitCommandEncoder" },
+	{ "computeCommandEncoder", "MTLComputeCommandEncoder" },
+	{ "newCommandQueue", "MTLCommandQueue" },
+	{ "commandBuffer", "MTLCommandBuffer" },
+	{ "newRenderPipelineState", "MTLRenderPipelineState" },
+	{ "newComputePipelineState", "MTLComputePipelineState" },
+	{ "newDepthStencilState", "MTLDepthStencilState" },
+	{ "newSamplerState", "MTLSamplerState" },
+	{ "newTexture", "MTLTexture" },
+	{ "newBuffer", "MTLBuffer" },
+	{ "newDefaultLibrary", "MTLLibrary" },
+	{ "newLibrary", "MTLLibrary" },
+	{ "newFunction", "MTLFunction" },
+	{ "newSharedEvent", "MTLSharedEvent" },
+	{ "newEvent", "MTLEvent" },
+	{ "newFence", "MTLFence" },
+	{ "newHeap", "MTLHeap" },
+	{ "newIndirectCommandBuffer", "MTLIndirectCommandBuffer" },
+	{ "newArgumentEncoder", "MTLArgumentEncoder" },
+	{ "newPipelineLibrary", "MTLPipelineLibrary" },
+	{ "newBinaryArchive", "MTLBinaryArchive" },
+	{ "newDynamicLibrary", "MTLDynamicLibrary" },
+	{ "newRasterizationRateMap", "MTLRasterizationRateMap" },
+	{ "newCounterSampleBuffer", "MTLCounterSampleBuffer" },
+	{ "newAccelerationStructure", "MTLAccelerationStructure" },
+	{ "newResidencySet", "MTLResidencySet" },
+	{ NULL, NULL }
+};
+
+static void stub_forward(id self, SEL _cmd, id inv);
+void *memcpy(void *, const void *, size_t);
+
+/*
+ * Buffers are real: on this GPU a Metal buffer is memory the CPU and the GPU share, and callers
+ * write into [buffer contents] (CoreAnimation's gamma LUT is bigger than any shared scratch).
+ * Each MTLBuffer stub gets its own allocation of the length asked for, or the caller's memory
+ * for newBufferWithBytesNoCopy:, and answers contents and length from it.
+ */
+#define NBUF 8192
+static struct {
+	id obj;
+	void *mem;
+	unsigned long len;
+} bufs[NBUF];
+static unsigned int nbufs;
+
+#define NNAME 4096
+static struct {
+	id obj;
+	char name[120];
+} names[NNAME];
+static unsigned int nnames;
+
+static void
+name_set(id obj, const char *n)
+{
+	names[nnames % NNAME].obj = obj;
+	snprintf(names[nnames % NNAME].name, sizeof(names[0].name), "%s", n);
+	nnames++;
+}
+
+static const char *
+name_of(id obj)
+{
+	for (unsigned int i = 0; i < NNAME && i < nnames; i++) {
+		if (names[i].obj == obj) {
+			return names[i].name;
+		}
+	}
+	return NULL;
+}
+
+/* A stub describes itself by kind and, when known, name: pipeline descriptors print it. */
+static id
+stub_description(id self, SEL _cmd)
+{
+	char d[200];
+	const char *n = name_of(self);
+	snprintf(d, sizeof(d), "<%s%s%s>", class_getName(object_getClass(self)) + 13, n ? " " : "", n ? n : "");
+	return ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"),
+	    sel_registerName("stringWithUTF8String:"), d);
+}
+
+static const char *
+utf8_of(id obj, char *buf, size_t len)
+{
+	id d = msg0(obj, "description");
+	const char *u = d != (id)0 ? ((const char *(*)(id, SEL))objc_msgSend)(d, sel_registerName("UTF8String")) : NULL;
+	size_t i = 0;
+	for (; u != NULL && u[i] != 0 && i + 1 < len; i++) {
+		buf[i] = (u[i] == '\n' || u[i] == '\t') ? ' ' : u[i];
+	}
+	buf[i] = 0;
+	return buf;
+}
+
+static void
+buffer_made(id obj, void *mem, unsigned long len)
+{
+	bufs[nbufs % NBUF].obj = obj;
+	bufs[nbufs % NBUF].mem = mem;
+	bufs[nbufs % NBUF].len = len;
+	nbufs++;
+}
+
+static int
+buffer_find(id obj)
+{
+	for (unsigned int i = 0; i < NBUF && i < nbufs; i++) {
+		if (bufs[i].obj == obj) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+static id stub_signature(id self, SEL _cmd, SEL sel);
+static id stub_unrecognized(id self, SEL _cmd, SEL sel);
+
+static int
+contains(const char *hay, const char *needle)
+{
+	return strstr(hay, needle) != NULL;
+}
+
+static Class
+stub_class(const char *proto_name)
+{
+	char name[160], spi_name[160];
+	snprintf(name, sizeof(name), "SapphireStub_%s", proto_name);
+	Class cls = objc_getClass(name);
+	if (cls != (Class)0) {
+		return cls;
+	}
+	cls = objc_allocateClassPair(objc_getClass("NSObject"), name, 0);
+	if (cls == (Class)0) {
+		return objc_getClass(name);
+	}
+	snprintf(spi_name, sizeof(spi_name), "%sSPI", proto_name);
+	void *spi = objc_getProtocol(spi_name), *pub = objc_getProtocol(proto_name);
+	if (spi != NULL) {
+		(void)class_addProtocol(cls, spi);
+		route_protocol(cls, spi, 0);
+	}
+	if (pub != NULL) {
+		(void)class_addProtocol(cls, pub);
+		route_protocol(cls, pub, 0);
+	}
+	(void)class_addMethod(cls, sel_registerName("forwardInvocation:"), (IMP_t)stub_forward, "v@:@");
+	(void)class_addMethod(cls, sel_registerName("methodSignatureForSelector:"), (IMP_t)stub_signature, "@@::");
+	(void)class_addMethod(cls, sel_registerName("doesNotRecognizeSelector:"), (IMP_t)stub_unrecognized, "@@::");
+	(void)class_addMethod(cls, sel_registerName("description"), (IMP_t)stub_description, "@@:");
+	/* Metal's own descriptors describe what they point at with this private one */
+	(void)class_addMethod(cls, sel_registerName("formattedDescription:"), (IMP_t)stub_description, "@@:Q");
+	objc_registerClassPair(cls);
+	SLOG("made %s (%s%s)", name, pub ? proto_name : "no protocol", spi ? " + SPI" : "");
+	return cls;
+}
+
+static id
+stub_for(SEL sel)
+{
+	const char *n = sel_getName(sel);
+	if (strcmp(n, "device") == 0) {
+		return sapphire_device;
+	}
+	for (int i = 0; stub_kinds[i].needle != NULL; i++) {
+		if (contains(n, stub_kinds[i].needle)) {
+			id obj = msg0((id)stub_class(stub_kinds[i].proto), "alloc");
+			return msg0(obj, "init");
+		}
+	}
+	return (id)0;
+}
+
+/* The routed call: log, then answer with a stub, _MTLDevice's implementation, or zero. */
+static void
+forward_common(id self, id inv, Class super_cls)
+{
+	SEL sel = ((SEL (*)(id, SEL))objc_msgSend)(inv, sel_registerName("selector"));
+	id sig = msg0(inv, "methodSignature");
+	unsigned long rlen = ((unsigned long (*)(id, SEL))objc_msgSend)(sig, sel_registerName("methodReturnLength"));
+	const char *rtype = ((const char *(*)(id, SEL))objc_msgSend)(sig, sel_registerName("methodReturnType"));
+	Method m = super_cls != (Class)0 ? class_getInstanceMethod(super_cls, sel) : (Method)0;
+	id stub = (rtype != NULL && rtype[0] == '@') ? stub_for(sel) : (id)0;
+	/*
+	 * A raw pointer (targetDeviceInfo, ...) gets zeroed memory rather than NULL, so a caller
+	 * that reads a field of it carries on and the trace goes further.
+	 */
+	static char zeros[65536];
+	int ptr = rtype != NULL && (rtype[0] == '^' || rtype[0] == '*') && rlen == sizeof(void *);
+	const char *who = class_getName(object_getClass(self));
+
+	if (sapphire_logged++ < 6000) {
+		SLOG("%s %s%s", strncmp(who, "SapphireStub_", 13) == 0 ? who + 13 : "device", sel_getName(sel),
+		    stub != (id)0 ? "  -> stub" : (ptr ? "  -> zeroed memory" : (m != NULL ? "  (to _MTLDevice)" : "")));
+	}
+	if (rlen > 0) {
+		void *zero = calloc(1, rlen < 64 ? 64 : rlen);
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), zero);
+		free(zero);
+	}
+	const char *sn = sel_getName(sel);
+	/* creation calls: log every object argument's description (names, paths, descriptors) */
+	if (strncmp(sn, "new", 3) == 0 && sapphire_logged < 6000) {
+		unsigned long nargs = ((unsigned long (*)(id, SEL))objc_msgSend)(sig, sel_registerName("numberOfArguments"));
+		for (unsigned long a = 2; a < nargs; a++) {
+			const char *at = ((const char *(*)(id, SEL, unsigned long))objc_msgSend)(sig,
+			    sel_registerName("getArgumentTypeAtIndex:"), a);
+			if (at == NULL || at[0] != '@') {
+				continue;
+			}
+			id arg = (id)0;
+			((void (*)(id, SEL, void *, long))objc_msgSend)(inv, sel_registerName("getArgument:atIndex:"), &arg, (long)a);
+			if (arg == (id)0) {
+				continue;
+			}
+			char b[600];
+			SLOG("  arg %lu: %s", a - 2, utf8_of(arg, b, sizeof(b)));
+			if (stub != (id)0 && a == 2 && (strncmp(sn, "newFunctionWithName", 19) == 0 ||
+			    strncmp(sn, "newRenderPipelineStateWithName", 30) == 0 ||
+			    strncmp(sn, "newComputePipelineStateWithName", 31) == 0)) {
+				name_set(stub, b);
+			}
+			if (stub != (id)0 && a == 2 && strncmp(sn, "newFunctionWithDescriptor", 25) == 0) {
+				id fn = msg0(arg, "name");
+				char nb[120];
+				if (fn != (id)0) {
+					name_set(stub, utf8_of(fn, nb, sizeof(nb)));
+				}
+			}
+		}
+	}
+	if (stub != (id)0 && strncmp(sn, "newBuffer", 9) == 0) {
+		unsigned long len = 0;
+		void *bytes = NULL;
+		if (strncmp(sn, "newBufferWithLength:", 20) == 0) {
+			((void (*)(id, SEL, void *, long))objc_msgSend)(inv, sel_registerName("getArgument:atIndex:"), &len, 2);
+		} else {
+			((void (*)(id, SEL, void *, long))objc_msgSend)(inv, sel_registerName("getArgument:atIndex:"), &bytes, 2);
+			((void (*)(id, SEL, void *, long))objc_msgSend)(inv, sel_registerName("getArgument:atIndex:"), &len, 3);
+		}
+		void *mem = strncmp(sn, "newBufferWithBytesNoCopy:", 25) == 0 ? bytes : calloc(1, len ? len : 16);
+		if (mem != bytes && bytes != NULL && len != 0) {
+			memcpy(mem, bytes, len);
+		}
+		buffer_made(stub, mem, len);
+		SLOG("  buffer %p: %lu bytes at %p", (void *)stub, len, mem);
+	}
+	int bi = strncmp(who, "SapphireStub_MTLBuffer", 22) == 0 ? buffer_find(self) : -1;
+	if (bi >= 0 && strcmp(sn, "contents") == 0) {
+		void *c = bufs[bi].mem;
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &c);
+	} else if (bi >= 0 && strcmp(sn, "length") == 0) {
+		unsigned long l = bufs[bi].len;
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &l);
+	} else if (stub != (id)0) {
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &stub);
+	} else if (ptr) {
+		void *z = zeros;
+		((void (*)(id, SEL, void *))objc_msgSend)(inv, sel_registerName("setReturnValue:"), &z);
+	} else if (m != NULL) {
+		((void (*)(id, SEL, IMP_t))objc_msgSend)(inv, sel_registerName("invokeUsingIMP:"), method_getImplementation(m));
+	}
+}
+
+static void
+stub_forward(id self, SEL _cmd, id inv)
+{
+	forward_common(self, inv, (Class)0);
+}
+
+static id
+stub_signature(id self, SEL _cmd, SEL sel)
+{
+	struct objc_super sup = { self, objc_getClass("NSObject") };
+	id sig = ((id (*)(struct objc_super *, SEL, SEL))objc_msgSendSuper)(&sup,
+	    sel_registerName("methodSignatureForSelector:"), sel);
+	if (sig == (id)0) {
+		sig = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSMethodSignature"),
+		    sel_registerName("signatureWithObjCTypes:"), "@@:");
+	}
+	return sig;
+}
+
+static id
+stub_unrecognized(id self, SEL _cmd, SEL sel)
+{
+	if (sapphire_logged++ < 6000) {
+		SLOG("%s %s: not implemented, answering 0", class_getName(object_getClass(self)), sel_getName(sel));
+	}
+	return (id)0;
+}
+
+@implementation SapphireMTLDevice
+
++ (void)load
+{
+	void *spi = objc_getProtocol("MTLDeviceSPI"), *pub = objc_getProtocol("MTLDevice");
+	Class cls = objc_getClass("SapphireMTLDevice");
+	/*
+	 * MTLAddDevice asserts [newDevice conformsToProtocol:@protocol(MTLDevice)], and Apple's
+	 * device classes declare <MTLDeviceSPI> (which takes in MTLDevice): declare both.
+	 */
+	if (spi != NULL) {
+		(void)class_addProtocol(cls, spi);
+		route_protocol(cls, spi, 0);
+	}
+	if (pub != NULL) {
+		(void)class_addProtocol(cls, pub);
+		route_protocol(cls, pub, 0);
+	}
+	SLOG("loaded, MTLDeviceSPI %s, MTLDevice %s", spi ? "found" : "MISSING", pub ? "found" : "MISSING");
+}
+
+/*
+ * Boot-arg sweetgl=1: CoreAnimation draws with OpenGL ES (Mesa's freedreno on the Adreno, xnu
+ * 0149) instead of Metal. In backboardd this bundle -- which Metal loads there because
+ * IOAcceleratorES names it -- loads the EAGL bridge (/redwood/lib/libredwood-gl.dylib, HackiOS's
+ * eagl.c, userland/), whose constructor takes over EAGLContext; and in every process it makes
+ * no Metal device, so CoreAnimation's render server falls back to OpenGL ES (EAGLServer).
+ */
+#define SAPPHIRE_GL "/redwood/lib/libredwood-gl.dylib"
+
+static int
+gl_mode(void)
+{
+	static int mode = -1;
+	if (mode < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		mode = sysctlbyname("kern.bootargs", args, &size, 0, 0) == 0 && strstr(args, "sweetgl=1") != 0;
+	}
+	return mode;
+}
+
+- (id)initWithAcceleratorPort:(unsigned int)port
+{
+	if (gl_mode()) {
+		static int loaded;
+		const char *name = getprogname();
+		if (!loaded && name != 0 && strcmp(name, "backboardd") == 0) {
+			loaded = 1;
+			/*
+			 * Mesa takes the GPU only if SapphireGPU (xnu 0149) is there when the first
+			 * context is made, and stays on the CPU (softpipe) for good otherwise; the service
+			 * comes up when the kernel's GPU tests end (gpu_delay). So wait for it, 90 s at most.
+			 */
+			int waited = 0;
+			for (; waited < 180; waited++) {
+				unsigned int gpu = IOServiceGetMatchingService(0, IOServiceMatching("SapphireGPU"));
+				if (gpu != 0) {
+					IOObjectRelease(gpu);
+					break;
+				}
+				usleep(500000);
+			}
+			SLOG("sweetgl=1: SapphireGPU %s after %d.%d s", waited < 180 ? "found" : "NOT found (Mesa draws on the CPU)",
+			    waited / 2, (waited % 2) * 5);
+			void *gl = dlopen(SAPPHIRE_GL, 2 /* RTLD_NOW */);
+			SLOG("sweetgl=1: %s %s", SAPPHIRE_GL, gl != 0 ? "loaded: CoreAnimation is to draw with OpenGL ES" : dlerror());
+		}
+		SLOG("sweetgl=1: no Metal device (port %u): OpenGL ES instead", port);
+		return (id)0;
+	}
+	self = [super init];
+	sapphire_port = port;
+	sapphire_device = self;
+	SLOG("initWithAcceleratorPort: %u -> %p", port, (void *)self);
+	static int tested;
+	if (!tested) {
+		tested = 1;
+		(void)sgpu_selftest(port);              /* once per process; logs its own result */
+	}
+	return self;
+}
+
+/*
+ * MetalPerformanceShaders (SpringBoard's blurs) identifies the GPU before anything else
+ * (MPSDevice::GetMPSDevice: supportsFamily: per family, name compared with isEqualToString:,
+ * gpuCoreCount), and asserts when it knows none of them. For the trace to go on, the device
+ * answers as this phone's iOS expects its GPU to: an A11, GPU family Apple4 and below, the
+ * common families, three cores. The real driver has to draw those blurs itself anyway.
+ */
+- (id)name
+{
+	static id n;
+	if (n == (id)0) {
+		n = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"),
+		    sel_registerName("stringWithUTF8String:"), "Apple A11 GPU");
+		n = msg0(n, "retain");
+	}
+	SLOG("device name -> Apple A11 GPU");
+	return n;
+}
+
+- (signed char)supportsFamily:(long)family
+{
+	signed char yes = (family >= 1001 && family <= 1004) || (family >= 3001 && family <= 3003);
+	SLOG("device supportsFamily: %ld -> %s", family, yes ? "YES" : "NO");
+	return yes;
+}
+
+- (unsigned long)gpuCoreCount
+{
+	SLOG("device gpuCoreCount -> 3");
+	return 3;
+}
+
+/* Everything routed to _objc_msgForward ends up here, as an NSInvocation. */
+- (void)forwardInvocation:(id)inv
+{
+	forward_common(self, inv, class_getSuperclass(objc_getClass("SapphireMTLDevice")));
+}
+
+/*
+ * A selector that is in no protocol gets a generic signature (object return, no arguments), so
+ * the runtime forwards it here instead of terminating the process; it is logged and answered
+ * zero without looking at its arguments.
+ */
+- (id)methodSignatureForSelector:(SEL)sel
+{
+	struct objc_super sup = { self, class_getSuperclass(objc_getClass("SapphireMTLDevice")) };
+	id sig = ((id (*)(struct objc_super *, SEL, SEL))objc_msgSendSuper)(&sup,
+	    sel_registerName("methodSignatureForSelector:"), sel);
+	if (sig == (id)0) {
+		if (sapphire_logged++ < 4000) {
+			SLOG("%s: in no protocol, answering 0", sel_getName(sel));
+		}
+		sig = ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSMethodSignature"),
+		    sel_registerName("signatureWithObjCTypes:"), "@@:");
+	}
+	return sig;
+}
+
+/* _MTLDevice's abstract methods call this; answer zero instead of raising. */
+- (id)doesNotRecognizeSelector:(SEL)sel
+{
+	if (sapphire_logged++ < 4000) {
+		SLOG("%s: not implemented (abstract or unknown), answering 0", sel_getName(sel));
+	}
+	return (id)0;
+}
+
+@end
