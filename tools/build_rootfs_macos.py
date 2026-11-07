@@ -33,7 +33,6 @@ def attach(img, mnt, readonly=True, is_raw=False):
     cmd.append(img)
     res = run(cmd, check=False)
     if res.returncode != 0:
-        # Fallback without CRawDiskImage or with it
         alt_cmd = ['hdiutil', 'attach', '-nobrowse', '-mountpoint', mnt]
         if readonly:
             alt_cmd += ['-readonly', '-noverify']
@@ -67,14 +66,22 @@ def main():
     for m in (mnt_root, mnt_os, mnt_sys, mnt_app):
         detach(m)
 
-    if os.path.exists(root_img):
-        os.remove(root_img)
+    for f in (root_img, root_img + '.dmg'):
+        if os.path.exists(f):
+            os.remove(f)
 
     print("Step 1: Creating empty 16GB HFS+ image...")
-    run(['hdiutil', 'create', '-size', '16g', '-fs', 'Case-sensitive Journaled HFS+', '-volname', 'iOSRoot', '-layout', 'NONE', root_img])
+    # hdiutil create adds .dmg automatically if no extension is recognized, so pass explicit .dmg
+    create_res = run(['hdiutil', 'create', '-size', '16g', '-fs', 'Case-sensitive Journaled HFS+', '-volname', 'iOSRoot', '-layout', 'NONE', root_img])
+    
+    # Check actual created file name
+    actual_img = root_img
+    if not os.path.exists(actual_img) and os.path.exists(root_img + '.dmg'):
+        os.rename(root_img + '.dmg', actual_img)
+    print(f"Created image confirmed at: {actual_img} ({os.path.getsize(actual_img)} bytes)")
 
     print("Step 2: Attaching root and source DMGs...")
-    attach(root_img, mnt_root, readonly=False, is_raw=True)
+    attach(actual_img, mnt_root, readonly=False, is_raw=True)
     attach(os_dmg, mnt_os, readonly=True)
     attach(sys_dmg, mnt_sys, readonly=True)
     attach(app_dmg, mnt_app, readonly=True)
@@ -148,8 +155,8 @@ def main():
         detach(mnt_root)
 
     print("Step 10: Converting to sparse image (img2simg)...")
-    run(['img2simg', root_img, simg])
-    os.remove(root_img)
+    run(['img2simg', actual_img, simg])
+    os.remove(actual_img)
     print(f"Generated userdata.simg successfully ({os.path.getsize(simg)} bytes)!")
 
 if __name__ == '__main__':
