@@ -31,7 +31,15 @@ jobs:
       - name: Assemble HFS+ iOS 16 Root Image via Python Builder
         run: |
           chmod +x tools/*.py
-          python3 tools/build_rootfs_macos.py
+          python3 tools/build_rootfs_macos.py 2>&1 | tee build_log.txt
+
+      - name: Upload Error Logs on Failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-log
+          path: build_log.txt
+          if-no-files-found: ignore
 
       - name: Prepare Artifact Parts
         run: |
