@@ -32,18 +32,35 @@ jobs:
         run: |
           chmod +x tools/*.py
           python3 tools/build_rootfs_macos.py 2>&1 | tee build_log.txt
+          ls -la out/ || true
 
-      - name: Upload Error Logs on Failure
+      - name: Upload Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-failure-log
+          name: build-log
           path: build_log.txt
           if-no-files-found: ignore
 
       - name: Prepare Artifact Parts
         run: |
-          SIMG="out/userdata.simg"
+          echo "Finding generated simg or img in out/..."
+          ls -la out/
+          
+          # Find either userdata.simg or any generated .simg / .img
+          SIMG=""
+          if [ -f "out/userdata.simg" ]; then
+            SIMG="out/userdata.simg"
+          else
+            SIMG=$(find out -type f \( -name "*.simg" -o -name "*.img" \) | head -n 1)
+          fi
+          
+          if [ -z "$SIMG" ] || [ ! -f "$SIMG" ]; then
+            echo "ERROR: No root image file found in out/!"
+            exit 1
+          fi
+          
+          echo "Using image: $SIMG ($(ls -lh "$SIMG" | awk '{print $5}'))"
           mkdir -p out/parts
           split -b 1900M "$SIMG" out/parts/userdata.simg.part_
           echo "To join on Windows: copy /b userdata.simg.part_* userdata.simg" > out/parts/HOW_TO_JOIN.txt
