@@ -28,104 +28,14 @@ jobs:
           python3 tools/remotezip.py "$URL" 087-86715-047.dmg dmgs
           ls -lh dmgs/
 
-      - name: Assemble HFS+ iOS 16 Root Image
+      - name: Assemble HFS+ iOS 16 Root Image via Python Builder
         run: |
-          mkdir -p out
-          OS_DMG="$(pwd)/dmgs/087-86698-044.dmg"
-          SYS_DMG="$(pwd)/dmgs/087-86593-047.dmg"
-          APP_DMG="$(pwd)/dmgs/087-86715-047.dmg"
-          ROOT_IMG="$(pwd)/out/ios16-root.img"
+          chmod +x tools/*.py
+          python3 tools/build_rootfs_macos.py
 
-          echo "Creating empty 16GB image..."
-          rm -f "$ROOT_IMG" "$ROOT_IMG.sparseimage"
-          hdiutil create -size 16g -fs "Case-sensitive Journaled HFS+" -volname iOSRoot -layout NONE "$ROOT_IMG"
-
-          mkdir -p /tmp/mnt_root /tmp/mnt_os /tmp/mnt_sys /tmp/mnt_app
-
-          echo "Attaching root image..."
-          hdiutil attach "$ROOT_IMG" -nobrowse -mountpoint /tmp/mnt_root
-
-          echo "Attaching DMGs..."
-          hdiutil attach "$OS_DMG" -nobrowse -mountpoint /tmp/mnt_os -readonly
-          hdiutil attach "$SYS_DMG" -nobrowse -mountpoint /tmp/mnt_sys -readonly
-          hdiutil attach "$APP_DMG" -nobrowse -mountpoint /tmp/mnt_app -readonly
-
-          echo "Copying OS root..."
-          sudo rsync -aHAX --exclude='.Spotlight*' /tmp/mnt_os/ /tmp/mnt_root/
-
-          echo "Copying Cryptexes..."
-          sudo mkdir -p /tmp/mnt_root/private/preboot/Cryptexes/OS /tmp/mnt_root/private/preboot/Cryptexes/App
-          sudo rsync -aHAX /tmp/mnt_sys/ /tmp/mnt_root/private/preboot/Cryptexes/OS/
-          sudo rsync -aHAX /tmp/mnt_app/ /tmp/mnt_root/private/preboot/Cryptexes/App/
-
-          echo "Hardlinking Dyld Shared Cache for ignition level 1..."
-          DSC="private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld"
-          sudo mkdir -p /tmp/mnt_root/System/Library/Caches/com.apple.dyld
-          for f in /tmp/mnt_root/"$DSC"/*; do
-            if [ -f "$f" ]; then
-              sudo ln -f "$f" "/tmp/mnt_root/System/Library/Caches/com.apple.dyld/$(basename "$f")" || sudo cp -p "$f" "/tmp/mnt_root/System/Library/Caches/com.apple.dyld/"
-            fi
-          done
-
-          echo "Hardlinking cryptex files without root counterparts..."
-          for c in OS App; do
-            (cd "/tmp/mnt_root/private/preboot/Cryptexes/$c" && sudo find . ! -type d ! -path './System/Library/Caches/com.apple.dyld/*') |
-            while IFS= read -r f; do
-              f=${f#./}
-              if ! sudo test -e "/tmp/mnt_root/$f" && ! sudo test -L "/tmp/mnt_root/$f"; then
-                sudo mkdir -p "/tmp/mnt_root/$(dirname "$f")"
-                src="/tmp/mnt_root/private/preboot/Cryptexes/$c/$f"
-                if sudo test -L "$src"; then
-                  sudo cp -P "$src" "/tmp/mnt_root/$f"
-                else
-                  sudo ln "$src" "/tmp/mnt_root/$f" 2>/dev/null || sudo cp -p "$src" "/tmp/mnt_root/$f"
-                fi
-              fi
-            done
-          done
-
-          echo "Setting up diagnostic directories and migration flags..."
-          DB="/tmp/mnt_root/private/var/db"
-          sudo mkdir -p "$DB/diagnostics/timesync" "$DB/uuidtext"
-          sudo chown -R 272:272 "$DB/diagnostics" "$DB/uuidtext" 2>/dev/null || true
-          sudo chmod 0751 "$DB/diagnostics"
-          sudo chmod 0755 "$DB/uuidtext" "$DB/diagnostics/timesync"
-          for d in diagnostics uuidtext diagnostics/timesync; do
-            sudo touch "$DB/$d/.migrated"
-            sudo chown 272:272 "$DB/$d/.migrated" 2>/dev/null || true
-            sudo chmod 0644 "$DB/$d/.migrated"
-          done
-
-          echo "Creating default system keybag..."
-          sudo mkdir -p "/tmp/mnt_root/private/var/keybags"
-          sudo chmod 0700 "/tmp/mnt_root/private/var/keybags"
-          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
-            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-            '<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
-            sudo tee "/tmp/mnt_root/private/var/keybags/systembag.kb" >/dev/null
-          sudo chmod 0600 "/tmp/mnt_root/private/var/keybags/systembag.kb"
-
-          echo "Applying sweet-root-tweaks (SpringBoard, Setup, launchd patch)..."
-          sudo python3 tools/sweet-root-tweaks.py /tmp/mnt_root
-
-          echo "Detaching mounts cleanly..."
-          sync
-          sudo hdiutil detach /tmp/mnt_os -force || true
-          sudo hdiutil detach /tmp/mnt_sys -force || true
-          sudo hdiutil detach /tmp/mnt_app -force || true
-          sudo hdiutil detach /tmp/mnt_root -force || true
-          ls -lh "$ROOT_IMG"
-
-      - name: Convert to Android Sparse Image (img2simg)
+      - name: Prepare Artifact Parts
         run: |
-          RAW_IMG="out/ios16-root.img"
           SIMG="out/userdata.simg"
-          echo "Converting raw HFS+ image to userdata.simg..."
-          img2simg "$RAW_IMG" "$SIMG"
-          ls -lh "$SIMG"
-          rm -f "$RAW_IMG"
-
-          echo "Splitting sparse image into parts for upload..."
           mkdir -p out/parts
           split -b 1900M "$SIMG" out/parts/userdata.simg.part_
           echo "To join on Windows: copy /b userdata.simg.part_* userdata.simg" > out/parts/HOW_TO_JOIN.txt
